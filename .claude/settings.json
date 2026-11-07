@@ -1,0 +1,38 @@
+{
+  "$schema": "https://json.schemastore.org/claude-code-settings.json",
+  "permissions": {
+    "allow": [
+      "mcp__apitest__list_modules",
+      "mcp__apitest__list_cases",
+      "mcp__apitest__get_case",
+      "mcp__apitest__list_marks",
+      "mcp__apitest__search_endpoints",
+      "mcp__apitest__get_endpoint",
+      "mcp__apitest__list_api_definitions",
+      "mcp__apitest__get_table_schema",
+      "mcp__apitest__query_db",
+      "mcp__apitest__get_last_result",
+      "mcp__apitest__diagnose_failures",
+      "mcp__apitest__get_coverage",
+      "mcp__apitest__find_field_mapping",
+      "mcp__apitest__explain_endpoint",
+      "mcp__apitest__search_knowledge",
+      "mcp__apitest__knowledge_status",
+      "mcp__apitest__rebuild_knowledge",
+      "mcp__apitest__read_case_assertions",
+      "mcp__apitest__propose_case_change",
+      "mcp__apitest__plan_heal",
+      "mcp__apitest__get_agent_audit",
+      "mcp__apitest__get_agent_cost"
+    ],
+    "ask": [
+      "mcp__apitest__run_cases",
+      "mcp__apitest__verify_heal",
+      "mcp__apitest__apply_case_change",
+      "mcp__apitest__set_case_status",
+      "mcp__apitest__create_case"
+    ],
+    "deny": []
+  },
+  "enabledMcpjsonServers": ["apitest"]
+}

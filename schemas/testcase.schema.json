@@ -1,0 +1,214 @@
+{
+  "$schema": "https://json-schema.org/draft/2020-12/schema",
+  "$id": "https://mall4j.local/schemas/testcase-v1.json",
+  "title": "接口自动化测试用例",
+  "description": "YAML/Excel 用例的统一格式定义。校验器用它提前拦住写错的用例。",
+  "type": "object",
+  "required": ["testcase"],
+  "additionalProperties": false,
+  "properties": {
+    "testcase": { "$ref": "#/$defs/testcase" }
+  },
+  "$defs": {
+    "testcase": {
+      "type": "object",
+      "required": ["name", "steps"],
+      "properties": {
+        "name": {
+          "type": "string",
+          "minLength": 1,
+          "maxLength": 200,
+          "description": "用例标识，同一项目内必须唯一"
+        },
+        "alias": { "type": "string", "description": "用例别名，报告里显示" },
+        "description": { "type": "string", "description": "用例说明" },
+        "order": { "type": "integer", "description": "执行顺序" },
+        "label": { "type": "string", "description": "报告里显示的标签" },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "debugged", "disabled", "broken"],
+          "description": "调试状态：draft=未调试(默认不跑)、debugged=调试通过(要跑)、disabled=调试通过但暂不跑、broken=调试不通过(不跑)"
+        },
+        "status": {
+          "type": "string",
+          "enum": ["draft", "debugged", "disabled", "broken"],
+          "description": "调试状态：draft=未调试(默认不跑)、debugged=调试通过(要跑)、disabled=调试通过但暂不跑、broken=调试不通过(不跑)"
+        },
+        "marks": { "$ref": "#/$defs/marks" },
+        "mark": { "$ref": "#/$defs/marks" },
+        "tags": { "$ref": "#/$defs/marks" },
+        "tag": { "$ref": "#/$defs/marks" },
+        "allure": { "$ref": "#/$defs/allure" },
+        "headers": { "$ref": "#/$defs/headers" },
+        "variables": { "type": "object", "description": "用例级公共变量" },
+        "parameters": { "$ref": "#/$defs/parameters" },
+        "depends_on": {
+          "type": "array",
+          "items": { "type": "string" },
+          "description": "依赖的其它用例名（同一项目内）。被依赖的用例必须先跑通"
+        },
+        "setups": { "$ref": "#/$defs/prepost" },
+        "teardowns": { "$ref": "#/$defs/prepost" },
+        "steps": {
+          "type": "array",
+          "minItems": 1,
+          "items": { "$ref": "#/$defs/step" }
+        }
+      }
+    },
+
+    "marks": {
+      "oneOf": [
+        { "type": "string" },
+        { "type": "array", "items": { "type": "string" } }
+      ]
+    },
+
+    "allure": {
+      "type": "object",
+      "properties": {
+        "epic": { "type": "string" },
+        "feature": { "type": "string" },
+        "story": { "type": "string" },
+        "severity": { "type": "string", "enum": ["blocker", "critical", "normal", "minor", "trivial"] },
+        "description": { "type": "string" },
+        "owner": { "type": "string" }
+      }
+    },
+
+    "headers": {
+      "type": "object",
+      "additionalProperties": { "type": ["string", "number", "boolean"] }
+    },
+
+    "parameters": {
+      "oneOf": [
+        {
+          "type": "object",
+          "description": "维度字典 —— 框架自动做笛卡尔积",
+          "additionalProperties": {
+            "oneOf": [
+              { "type": "array", "items": {} },
+              { "type": "object" }
+            ]
+          }
+        },
+        {
+          "type": "array",
+          "description": "场景列表 —— 每个场景一组参数",
+          "items": {
+            "type": "object",
+            "required": ["data"],
+            "properties": {
+              "name": { "type": "string" },
+              "data": { "type": "object" }
+            }
+          }
+        }
+      ]
+    },
+
+    "prepost": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/prepostItem" }
+    },
+
+    "prepostItem": {
+      "type": "object",
+      "required": ["id", "operation_type"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1 },
+        "operation_type": {
+          "type": "string",
+          "enum": ["api", "db", "factory", "factory_cleanup"]
+        },
+        "description": { "type": "string" },
+        "path": { "type": "string" },
+        "method": { "type": "string" },
+        "headers": { "$ref": "#/$defs/headers" },
+        "params": { "type": "object" },
+        "data": { "type": "object" },
+        "query": { "type": "string" },
+        "factory": { "type": "string" },
+        "assert": { "$ref": "#/$defs/asserts" }
+      }
+    },
+
+    "step": {
+      "type": "object",
+      "required": ["id"],
+      "properties": {
+        "id": { "type": "string", "minLength": 1, "description": "步骤ID，同一用例内唯一" },
+        "description": { "type": "string" },
+        "project": { "type": "string", "description": "调用的项目（跨项目时用）" },
+        "api": {
+          "type": "string",
+          "description": "引用的接口定义名（在 testcases/apis/<项目>/<模块>.yaml 里定义）。写了它就不用再写 path/method"
+        },
+        "path": { "type": "string" },
+        "method": {
+          "type": "string",
+          "enum": ["GET", "POST", "PUT", "PATCH", "DELETE", "HEAD", "OPTIONS"]
+        },
+        "operation_type": {
+          "type": "string",
+          "enum": ["login", "login_no_slider", "noop", "mock"],
+          "description": "特殊步骤类型；mock=走本地 Mock 服务"
+        },
+        "headers": { "$ref": "#/$defs/headers" },
+        "params": { "type": "object" },
+        "data": { "type": ["object", "array", "string", "number", "boolean"] },
+        "files": { "type": ["object", "array"] },
+        "timeout": { "type": "integer", "minimum": 1, "maximum": 600 },
+        "username": { "type": "string", "description": "登录步骤的用户名" },
+        "password": { "type": "string", "description": "登录步骤的密码" },
+        "value": { "description": "noop 步骤返回的值" },
+        "mock": { "$ref": "#/$defs/mock" },
+        "assert": { "$ref": "#/$defs/asserts" }
+      }
+    },
+
+    "mock": {
+      "type": "object",
+      "description": "Mock 配置：把某个接口的响应替换成本地预设的值",
+      "properties": {
+        "enabled": { "type": "boolean", "default": true },
+        "status": { "type": "integer", "minimum": 100, "maximum": 599, "default": 200 },
+        "response": { "description": "预设响应体" },
+        "headers": { "$ref": "#/$defs/headers" },
+        "delay": { "type": "number", "minimum": 0, "description": "延迟秒数，模拟慢接口" },
+        "error": { "type": "string", "description": "模拟网络错误" }
+      }
+    },
+
+    "asserts": {
+      "type": "array",
+      "items": { "$ref": "#/$defs/assertItem" }
+    },
+
+    "assertItem": {
+      "type": "object",
+      "required": ["type"],
+      "properties": {
+        "type": {
+          "type": "string",
+          "minLength": 1,
+          "description": "断言类型。响应类：equal/not_equal/exists/subset/contains/matches/gt/gte/lt/lte/length/type/approx_equal/jwt_claim/full_body；元信息类：status_code/status/response_header/elapsed_time；外部校验类：db_*/redis_*/mq_*。空格和下划线等价（is not None = is_not_none）"
+        },
+        "field": { "type": "string", "description": "响应体里的字段路径，如 result.data.id" },
+        "expected": { "description": "期望值" },
+        "comparator": { "type": "string", "description": "比较符，如 ==、!=、>、<" },
+        "container": { "description": "in / not_in 断言的候选集合" },
+        "query": { "type": "string", "description": "数据库断言的 SQL" },
+        "params": { "type": "array", "description": "SQL 参数（防注入，别拼字符串）" },
+        "alias": { "type": "string", "description": "数据库别名（多库时指定）" },
+        "column": { "description": "取第几列或哪一列" },
+        "key": { "type": "string", "description": "Redis 键" },
+        "queue": { "type": "string", "description": "MQ 队列名" },
+        "topic": { "type": "string", "description": "Kafka topic" },
+        "tolerance": { "type": "number", "description": "approx_equal 的误差范围" },
+        "negate": { "type": "boolean", "description": "matches 断言取反" }
+      }
+    }
+  }
+}

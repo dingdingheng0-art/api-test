@@ -1,0 +1,149 @@
+# ============================================================================
+# GitLab CI —— 接口自动化测试
+#
+# 用法：把本文件放到项目根目录（或者在 .gitlab-ci.yml 里 include 进来）。
+#
+# 需要配的变量（Settings > CI/CD > Variables）：
+#   MALL4J_USERNAME     登录账号
+#   MALL4J_PASSWORD     登录密码
+#   AI_API_KEY          AI 功能用的 key（可选）
+#   ALLURE_CLI_VERSION  allure 命令行版本（可选，默认 2.29.0）
+#
+# 产物：
+#   reports/            归档成 artifact，GitLab 页面能直接下载
+# ============================================================================
+
+stages:
+  - check
+  - smoke
+  - regression
+  - report
+
+variables:
+  PIP_CACHE_DIR: "$CI_PROJECT_DIR/.cache/pip"
+  PYTHONIOENCODING: "UTF-8"
+  PYTHONUNBUFFERED: "1"
+  GIT_DEPTH: "20"
+  # 通知策略：只在失败时发（not_send / on_fail / always）
+  APITEST_NOTIFY_POLICY: "on_fail"
+  # 通知渠道：留空就从数据库 config_webhook 表读配置
+  # APITEST_NOTIFY: "ding_ding"
+
+# ---------------------------------------------------------------------------
+# 缓存 Python 包
+# ---------------------------------------------------------------------------
+cache:
+  key:
+    files:
+      - requirements.txt
+  paths:
+    - .cache/pip
+    - .cache/pypoetry/artifacts
+
+# ---------------------------------------------------------------------------
+# 公共片段
+# ---------------------------------------------------------------------------
+.setup: &setup
+  before_script:
+    - python --version
+    - pip install -r requirements.txt
+    - pip install pytest-html
+
+# ---------------------------------------------------------------------------
+# 阶段 1：环境检查
+# ---------------------------------------------------------------------------
+check:
+  stage: check
+  <<: *setup
+  script:
+    - echo "分支: $CI_COMMIT_REF_NAME / 提交: $CI_COMMIT_SHORT_SHA"
+    - python -c "import pytest, yaml, requests, cv2, numpy, playwright, openpyxl"
+  rules:
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+    - if: $CI_COMMIT_BRANCH
+
+# ---------------------------------------------------------------------------
+# 阶段 2：冒烟测试（只跑 smoke 标签）
+# ---------------------------------------------------------------------------
+smoke:
+  stage: smoke
+  <<: *setup
+  variables:
+    APITEST_ENV: pre
+  script:
+    - |
+      python ci/run_ci.py \
+        --env ${APITEST_ENV} \
+        --mark smoke \
+        --report allure \
+        --no-diagnosis
+  artifacts:
+    when: always
+    expire_in: 3 days
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit.xml
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+    - if: $CI_PIPELINE_SOURCE == "merge_request_event"
+
+# ---------------------------------------------------------------------------
+# 阶段 3：全量回归
+# ---------------------------------------------------------------------------
+regression:
+  stage: regression
+  <<: *setup
+  variables:
+    APITEST_ENV: pre
+  script:
+    - |
+      # 通知渠道没配就从数据库读（config_webhook 表）
+      NOTIFY_ARG=""
+      if [ -n "$APITEST_NOTIFY" ]; then
+        NOTIFY_ARG="--notify $APITEST_NOTIFY"
+      fi
+      python ci/run_ci.py \
+        --env ${APITEST_ENV} \
+        --notify-policy ${APITEST_NOTIFY_POLICY} \
+        ${NOTIFY_ARG} \
+        --report allure
+  artifacts:
+    when: always
+    expire_in: 7 days
+    paths:
+      - reports/
+    reports:
+      junit: reports/junit.xml
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH
+  allow_failure: false
+
+# ---------------------------------------------------------------------------
+# 阶段 4：出报告
+# ---------------------------------------------------------------------------
+report:
+  stage: report
+  needs:
+    - job: regression
+      artifacts: true
+  script:
+    - |
+      if [ -f reports/ci_summary.json ]; then
+        echo "测试结果："
+        cat reports/ci_summary.json
+      else
+        echo "没有找到 CI 汇总文件"
+      fi
+    - |
+      if [ -d reports/analysis ]; then
+        echo "根因分析报告："
+        ls -la reports/analysis/
+      fi
+  artifacts:
+    when: always
+    expire_in: 30 days
+    paths:
+      - reports/analysis/
+  rules:
+    - if: $CI_COMMIT_BRANCH == $CI_DEFAULT_BRANCH

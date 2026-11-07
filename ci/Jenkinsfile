@@ -1,0 +1,136 @@
+// ============================================================================
+// Jenkins 流水线 —— 接口自动化测试
+//
+// 用法：
+//   1. 新建 Pipeline 项目，脚本指向本文件
+//   2. 节点要装好 Python 3.12+、 allure 命令行
+//   3. 凭据里配好 target-password / AI_API_KEY 等敏感变量
+//
+// ⚠️ **接新系统时改这几处**：
+//    1. 下面 environment 里的凭据名
+//    2. configs/config.yaml 的 projects 段（项目档案）
+//    3. configs/config.yaml 的 default_project（默认跑哪个项目）
+//
+// 参数：
+//   - ENV       测试环境（online / pre / test），默认 pre
+//   - MARK      按标签筛选（smoke / p0 ...），空 = 全跑
+//   - BRANCH    分支名（GitLab 里同名）
+//   - NOTIFY    通知渠道（ding_ding / we_chat / feishu），空 = 从数据库读
+//   - WORKERS   并行进程数，默认 1（串行）
+// ============================================================================
+
+pipeline {
+    agent any
+
+    parameters {
+        string(name: 'ENV', defaultValue: 'pre', description: '测试环境')
+        string(name: 'PROJECT', defaultValue: '', description: '项目名（空=用配置里的 default_project）')
+        string(name: 'MARK', defaultValue: '', description: '按标签筛选（空=全跑）')
+        string(name: 'BRANCH', defaultValue: '', description: '分支名')
+        string(name: 'NOTIFY', defaultValue: '', description: '通知渠道（空=读数据库配置）')
+        string(name: 'WORKERS', defaultValue: '1', description: '并行进程数')
+    }
+
+    options {
+        timestamps()
+        timeout(time: 60, unit: 'MINUTES')
+        buildDiscarder(logRotator(numToKeepStr: '20'))
+    }
+
+    environment {
+        // 敏感信息不要写在文件里 —— 在 Jenkins 凭据里配同名变量
+        //
+        // ⚠️ 变量名必须和 configs/config.yaml 里的占位符一致（${MALL4J_USERNAME}）。
+        //    以前这里注入的是 TARGET_USERNAME，配置里读的却是 MALL4J_USERNAME，
+        //    两个名字对不上 —— CI 里登录一直悄悄用着配置里的默认账号密码。
+        //    换系统时改这三处：这里、config.yaml 的占位符、Jenkins 凭据名。
+        MALL4J_USERNAME = credentials('mall4j-username')
+        MALL4J_PASSWORD = credentials('mall4j-password')
+        PYTHONIOENCODING = 'UTF-8'
+        PYTHONUNBUFFERED = '1'
+        CI = 'true'
+    }
+
+    stages {
+
+        stage('检出代码') {
+            steps {
+                checkout scm
+                sh 'echo "分支: ${BRANCH_NAME}"'
+            }
+        }
+
+        stage('检查环境') {
+            steps {
+                sh 'python --version'
+                sh 'pip --version'
+                // 依赖装不上就在这里挂掉，别等跑用例时才炸
+                sh 'pip install -r requirements.txt'
+                sh 'python -c "import pytest, yaml, requests, cv2, numpy, playwright, openpyxl"'
+            }
+        }
+
+        stage('冒烟测试') {
+            steps {
+                script {
+                    def project = params.PROJECT ? "--project ${params.PROJECT}" : ''
+                    // 冒烟挂了直接停 —— 后面的全量回归没意义
+                    sh """
+                        python ci/run_ci.py \
+                            --env ${ENV} \
+                            ${project} \
+                            --mark smoke \
+                            --report allure \
+                            --no-diagnosis
+                    """
+                }
+            }
+        }
+
+        stage('全量回归') {
+            steps {
+                script {
+                    def project = params.PROJECT ? "--project ${params.PROJECT}" : ''
+                    def mark = params.MARK ? "--mark ${params.MARK}" : ''
+                    // 通知渠道：参数指定了就用指定的，没指定就从数据库读配置
+                    def notify = params.NOTIFY ? "--notify ${params.NOTIFY}" : ''
+                    def workers = params.WORKERS && params.WORKERS != '1' ? "--workers ${params.WORKERS}" : ''
+                    sh """
+                        python ci/run_ci.py \
+                            --env ${ENV} \
+                            ${project} \
+                            ${mark} \
+                            ${notify} \
+                            ${workers} \
+                            --notify-policy on_fail \
+                            --report allure
+                    """
+                }
+            }
+        }
+
+        stage('归档报告') {
+            steps {
+                archiveArtifacts artifacts: 'reports/**/*', allowEmptyArchive: true
+                junit testResults: 'reports/junit.xml', allowEmptyResults: true
+            }
+        }
+    }
+
+    post {
+        always {
+            echo '--- 测试结果 ---'
+            if (fileExists('reports/ci_summary.json')) {
+                def summary = readJSON file: 'reports/ci_summary.json'
+                echo "结论: ${summary.conclusion}"
+                echo "通过 ${summary.passed} / 失败 ${summary.failed} / 错误 ${summary.error}"
+            }
+        }
+        failure {
+            // 挂了把根因分析报告链接发出来
+            if (fileExists('reports/analysis')) {
+                echo '根因分析报告在哦看 reports/analysis/ 目录'
+            }
+        }
+    }
+}

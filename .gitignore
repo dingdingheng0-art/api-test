@@ -1,0 +1,48 @@
+# ===== Python =====
+__pycache__/
+*.py[cod]
+*.egg-info/
+.venv/
+venv/
+
+# ===== 测试产物 =====
+.pytest_cache/
+.pytest_cache_dead/
+.mypy_cache/
+.ruff_cache/
+
+# ===== 登录 token 缓存（含明文 token / uuid，别提交）=====
+.cache/
+
+# ===== 本地敏感信息（密码 / token / 凭证，别提交）=====
+.env
+.env.local
+*.env
+!configs/.env.example
+
+# ===== 报告 =====
+reports/
+allure-results/
+allure_*/
+
+# ===== 日志 =====
+logs/
+*.log
+
+# ===== 调试图片 / 临时数据 =====
+data/debug/
+data/tmp/
+
+# ===== 工具生成的备份 =====
+*.bak
+*.bak-*
+
+# ===== 代码索引缓存（IDE / CodeGraph，几十 MB，可随时重建）=====
+.codegraph/
+.jbeval/
+
+# ===== IDE =====
+.idea/
+.vscode/
+*.swp
+.DS_Store

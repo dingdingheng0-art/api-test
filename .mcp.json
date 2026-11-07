@@ -1,0 +1,14 @@
+{
+  "$schema": "https://json.schemastore.org/mcp.json",
+  "mcpServers": {
+    "apitest": {
+      "type": "stdio",
+      "command": "C:/Users/Mac/Desktop/api-test/.venv/Scripts/python.exe",
+      "args": ["-m", "ai.mcp_server"],
+      "env": {
+        "PYTHONIOENCODING": "utf-8",
+        "PYTHONUTF8": "1"
+      }
+    }
+  }
+}

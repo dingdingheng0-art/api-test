@@ -1,0 +1,424 @@
+# ============================================================================
+# 唯一配置文件
+#
+# 这里既有"被测系统的基础信息"（utils/ 下的老代码在用），
+# 也有"接口自动化框架的项目 / 环境配置"（apitest/ 框架在用）。
+# 合并成一处，改配置不用到处找。
+# ============================================================================
+
+# ============ 被测系统配置 ============
+base_url: "http://103.236.97.137:8190/_admin"
+
+# 前端管理后台（Origin/Referer 固定值，必须与抓包一致）
+origin: "http://103.236.97.137:8190"
+referer: "http://103.236.97.137:8190/"
+
+# 浏览器 UA
+user_agent: >-
+  Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36
+  (KHTML, like Gecko) Chrome/156.0.0.0 Safari/537.36 Edg/156.0.0.0
+
+# 浏览器 sec-ch-ua 家族
+sec_ch_ua: >-
+  "Not:A-Brand";v="8", "Chromium";v="156", "Microsoft Edge";v="156"
+
+# ============ 登录账号 ============
+# ⚠️ 密码不要写在文件里（这个文件是要提交到 git 的）。
+#    这里用 ${环境变量} 占位，加载时自动替换。值的来源优先级：
+#      1. 进程环境变量
+#      2. 项目根目录的 .env 文件（本地开发用，不进 git）
+#      3. 下面的默认值（**默认是空的**，没配就是空密码）
+#
+#    本地配置方法：复制 configs/.env.example 成 .env，填上密码。
+#
+#    ⚠️ 默认值必须是空的。以前这里写死 123456，CI 里凭据变量名又对不上，
+#       结果「没配密码」也会用 123456 去登录 —— 看起来一切正常，其实打的是错的账号。
+login:
+  username: "${MALL4J_USERNAME:admin}"
+  password: "${MALL4J_PASSWORD:}"
+
+# ============ 滑块图像识别配置（一般不需要动）============
+slider:
+  # 调试图保存目录（相对项目根）
+  debug_dir: "data/debug"
+  # 调试图：true 会在 data/debug/ 落 3 张
+  save_debug: true
+
+
+# ============================================================================
+# 接口自动化框架配置
+# ============================================================================
+
+# ============ 默认环境（命令行 --apienv 或环境变量 APITEST_ENV 可覆盖）============
+# ⚠️ 默认**不要**指向生产 —— 本地随手跑一次就打到线上太危险。
+#    要测生产请显式指定：pytest --apienv online
+default_env: test
+
+# ============================================================================
+# 用例来源：用 Excel 维护，还是用 YAML 维护
+# ============================================================================
+#
+# 平台支持两种用例维护方式，但**一次只启用一种** ——
+# 两边都跑的话，同一个接口会被跑两遍，报告也重复。
+#
+#   excel —— 只跑 Excel 用例（testcases/cases_excel/），YAML 一概不碰
+#   yaml  —— 只跑 YAML 用例（testcases/cases/），Excel 一概不碰
+#   both  —— 两边都跑（迁移过渡期用，平时不建议）
+#
+# 优先级：命令行 --case-source > 环境变量 APITEST_CASE_SOURCE > 这里
+case_source:
+  mode: excel
+  # 目录可以改（相对项目根的路径，或写绝对路径）
+  excel_dir: "testcases/cases_excel"
+  yaml_dir: "testcases/cases"
+
+storage:
+  # 存储模式
+  #
+  # file   —— 只用 YAML/Excel 文件（默认，零依赖，老行为完全不变）
+  # mirror —— 文件为准，同时镜像到数据库（查询方便，文件仍是源）
+  # db    —— 数据库为准（平台模式）
+  #
+  # 想临时改：环境变量 APITEST_STORAGE=mirror
+  mode: file
+
+# ============================================================================
+# 校验层配置（数据库 / 缓存 / 消息队列）
+#
+# 这三块都是**可选的** —— 不配就只是用不了对应的断言，
+# 用例和框架照跑不误。
+#
+# 敏感信息走环境变量占位符（这个文件要进 git）：
+#   PowerShell:  $env:DB_PASSWORD = "你的密码"
+# ============================================================================
+
+# ---------- 数据库 ----------
+db:
+  default:
+    type: mysql              # mysql / sqlite
+    host: 127.0.0.1
+    port: 3306
+    user: root
+    password: "${DB_PASSWORD:}"
+    # 库名 —— 换项目的时候改这里。
+    # 用 `python tools/maint/dump_schema.py --list` 确认能不能读到表。
+    database: test_platform
+    # 本地自测可以用 sqlite（不用装任何东西，也不用知道数据库信息）：
+    # default:
+    #   type: sqlite
+    #   database: data/demo.db
+
+  # ---------- mall4j 业务库（用例里的「查库断言」用）----------
+  # 用例断言里写 alias: mall4j 就走这套；不写 alias 走上面的 default。
+  #
+  # 连接信息全部走 .env（这个文件要进 git，不能写死账号密码）：
+  #   MALL4J_DB_HOST=103.236.97.137
+  #   MALL4J_DB_PORT=3306
+  #   MALL4J_DB_USER=...
+  #   MALL4J_DB_PASSWORD=...
+  #   MALL4J_DB_NAME=...
+  #
+  # 没配之前，用到 mall4j 查库断言的用例会明确报「连不上」，
+  # 不会悄悄跳过 —— 这样不会出现"以为验了、其实没验"。
+  mall4j:
+    type: mysql
+    host: "${MALL4J_DB_HOST:}"
+    port: "${MALL4J_DB_PORT:3306}"
+    user: "${MALL4J_DB_USER:}"
+    password: "${MALL4J_DB_PASSWORD:}"
+    database: "${MALL4J_DB_NAME:}"
+
+# ---------- 缓存（Redis）----------
+redis:
+  default:
+    host: 127.0.0.1
+    port: 6379
+    db: 0
+    password: "${REDIS_PASSWORD:}"
+    decode_responses: true
+    socket_timeout: 5
+
+# ---------- 消息队列 ----------
+mq:
+  default:
+    type: rabbitmq          # rabbitmq / kafka / memory
+    host: 127.0.0.1
+    port: 5672
+    user: guest
+    password: "${MQ_PASSWORD:guest}"
+    vhost: "/"
+    queue: order.created     # 默认消费的队列
+    # Kafka 用这个（type: kafka 时）：
+    # bootstrap_servers: "127.0.0.1:9092"
+
+# ============================================================================
+# 用例依赖（depends_on）
+#
+# 有依赖关系的用例必须串行：上游跑完把结果落盘（.cache/dependencies/），
+# 下游读出来用 {{上游用例名.步骤.字段}} 引用。
+# ============================================================================
+dependency:
+  # 并行时，下游用例等上游结果的**总时长**（秒）。
+  #
+  # ⚠️ 这是「一条用例所有依赖加起来」的预算，不是每个依赖各算一份。
+  #    以前写死 600 秒且逐个依赖计算，依赖一多 CI 就像卡死了。
+  #    临时调整：$env:APITEST_DEPENDENCY_TIMEOUT = "300"
+  wait_timeout: 120
+
+  # 结果文件的有效期（秒）。超过就当作没有结果。
+  #
+  # 为什么要有这个：结果里存的是「上一轮造出来的数据 id」。
+  # 上一轮的 id 拿到这一轮去删/改，目标可能已经是别的记录了。
+  # 每轮开始还会清掉过期的文件（默认 6 小时）。
+  result_max_age: 21600
+
+# ============================================================================
+# 限流（令牌桶）
+#
+# 保护测试环境不被自己压垮。统计类接口限制严，单独配一个更低的 QPS。
+# 想临时关掉：$env:APITEST_NO_RATE_LIMIT = "1"
+# ============================================================================
+rate_limit:
+  enabled: true
+  default:
+    qps: 10                 # 每秒最多几个请求
+    burst: 20               # 突发上限（桶容量）
+    wait_timeout: 30        # 拿不到令牌最多等多久（秒）
+  projects:
+    mall4j:
+      qps: 5
+      burst: 10
+
+# ============================================================================
+# 用例级重试
+#
+# 只重试"疑似环境抖动"的失败（网络超时、5xx、限流），
+# 断言失败**不重试** —— 免得掩盖真 bug。
+# 想临时关掉：$env:APITEST_NO_RETRY = "1"
+# ============================================================================
+retry:
+  enabled: true
+  max_attempts: 3           # 总共试几次（含第一次）
+  wait_seconds: 2
+  backoff: 1.5              # 等待时间的递增倍数
+
+# ============================================================================
+# AI 配置（用例生成 / 缺陷分析）
+#
+# 没配也能用 —— 用例生成会退回本地模板，缺陷分析会退回规则分类。
+# OpenAI 兼容协议：DeepSeek / 通义 / 智谱 / Ollama 都能接。
+# ============================================================================
+ai:
+  base_url: "${AI_BASE_URL:}"
+  api_key: "${AI_API_KEY:}"
+  model: "${AI_MODEL:}"
+  timeout: 60
+  temperature: 0.3
+
+# 默认打哪个项目（跑测试时不用每次都指定）
+default_project: "mall4j"
+
+# ============================================================================
+# 正式地址清单
+#
+# 框架用它来判断"我是不是在打线上"：
+# 如果某个**测试环境**（test / pre / dev）的 host 命中了下面任何一个，
+# 跑测试就会真的打到线上 —— 框架会大声警告。
+#
+# ⚠️ 把你自己的正式地址填进来（域名片段，能匹配上就行）。
+#    没配的话框架会用兜底启发式：环境名写着 test/pre，
+#    但地址里一个"测试"字样都没有 → 也当正式地址处理。
+# ============================================================================
+production_hosts: []
+# 例子：
+# production_hosts:
+#   - "admin-api.my-shop.com"
+#   - "api.my-shop.com"
+
+# ============================================================================
+# 安全防护
+#
+# 防止测试用例误删真实数据。
+#
+# 用例里写着 `DELETE /admin/area/1` 这种占位路径时，
+# 它真的会去删 id=1 那条记录 —— 行政区划、菜单、角色这些是基础配置数据，
+# 删掉后台就瘫了。
+#
+# 规则：DELETE / PUT / POST 命中 protected_paths 里的路径时，
+# 目标 id 必须落在 safe_ids / safe_id_ranges 里，否则请求被拦下、用例失败。
+#
+# 临时全放行：$env:APITEST_ALLOW_DANGEROUS_DELETE = "1"
+# ============================================================================
+safety:
+  dangerous_write:
+    # 受保护的基础数据路径（按前缀匹配）
+    protected_paths:
+      - /admin/area
+      - /sys/menu
+      - /sys/role
+      - /sys/user
+      - /sys/config
+      - /admin/user
+      - /admin/attribute
+      - /admin/brand
+      - /admin/delivery
+      - /admin/message
+      - /admin/indexImg
+      - /admin/hotSearch
+      - /prod/category
+      - /prod/prod
+      - /prod/prodTag
+      - /prod/prodComm
+      - /prod/spec
+      - /shop/notice
+      - /shop/pickAddr
+      - /shop/shopDetail
+      - /shop/transport
+      - /user/addr
+      - /generator/prodTagReference
+
+    # 明确允许删的 id（自己造出来的测试数据）
+    safe_ids: []
+
+    # 允许删的 id 区间，写成 "起-止"
+    # 例：["900000000000-999999999999"] 只放行自己造的测试数据
+    safe_id_ranges:
+      - "900000000000-999999999999"
+
+projects:
+  # 被测项目：mall4j 管理后台
+  #
+  # 每个项目/环境的这段就是它的"档案"（utils/project_profile.py 读它）：
+  #   host         —— 接口根地址（这里已经带上 /_admin 前缀）
+  #   web_url      —— 前端管理后台地址
+  #   login_page   —— 登录页地址
+  #   auth         —— 鉴权头叫什么（框架自动帮你带上）
+  #   login.type   —— 登录方式：slider / custom（自己的函数）/ password（直接账号密码）
+  #
+  # 没写的字段都有默认值（见 project_profile.py），
+  # 所以老配置只写 host 也能照常跑。
+  mall4j:
+    online:
+      host: "http://103.236.97.137:8190/_admin"
+      is_need_login: True
+      label: "mall4j 管理后台"
+      web_url: "http://103.236.97.137:8190"
+      login_page: "http://103.236.97.137:8190/login"
+      auth:
+        token_header: "Authorization"   # 业务接口的鉴权头
+        session_header: null            # 没有额外的会话标识头
+        token_var: "token"
+        session_var: "uuid"
+      login:
+        # 登录链路是：取拼图验证码 → 校验 → 带票据+加密密码登录
+        # 框架内置的滑块登录对不上这套协议，写在 adapters/mall4j.py 里
+        type: custom
+        custom_method: "adapters.mall4j.login"
+        # 密码走环境变量或 .env 文件，别写死（这个文件要进 git）
+        data:
+          username: "${MALL4J_USERNAME:admin}"
+          password: "${MALL4J_PASSWORD:}"
+
+    pre:
+      host: "${MALL4J_PRE_HOST:http://103.236.97.137:8190/_admin}"
+      is_need_login: True
+      label: "mall4j 管理后台（预发）"
+      web_url: "${MALL4J_PRE_WEB_URL:http://103.236.97.137:8190}"
+      login_page: "${MALL4J_PRE_WEB_URL:http://103.236.97.137:8190}/login"
+      auth:
+        token_header: "Authorization"
+        session_header: null
+        token_var: "token"
+        session_var: "uuid"
+      login:
+        type: custom
+        custom_method: "adapters.mall4j.login"
+        data:
+          username: "${MALL4J_USERNAME:admin}"
+          password: "${MALL4J_PASSWORD:}"
+
+    # 本地/测试环境 —— 默认环境指的就是这个
+    test:
+      host: "${MALL4J_TEST_HOST:http://103.236.97.137:8190/_admin}"
+      is_need_login: True
+      label: "mall4j 管理后台（测试环境）"
+      web_url: "${MALL4J_TEST_WEB_URL:http://103.236.97.137:8190}"
+      login_page: "${MALL4J_TEST_WEB_URL:http://103.236.97.137:8190}/login"
+      auth:
+        token_header: "Authorization"
+        session_header: null
+        token_var: "token"
+        session_var: "uuid"
+      login:
+        type: custom
+        custom_method: "adapters.mall4j.login"
+        data:
+          username: "${MALL4J_USERNAME:admin}"
+          password: "${MALL4J_PASSWORD:}"
+
+  # # ==========================================================================
+  # # 示例项目 —— 演示"怎么把第二个系统接进这套框架"
+  # #
+  # # 地址是假的（example.invalid），跑起来必然连不上，这是故意的。
+  # # 它的作用是让框架的多系统兼容逻辑有东西可测，
+  # # 也是你接入自己系统时的模板 —— 照着 mall4j 那段改就行。
+  # # ==========================================================================
+  # demo_shop:
+  #   online:
+  #     host: "https://api.example.invalid"
+  #     is_need_login: True
+  #     label: "示例商城（演示多系统兼容）"
+  #     # 注意：没配 web_url / login_page —— 纯 API 系统不该带浏览器那套头
+  #     auth:
+  #       token_header: "token"
+  #       session_header: "sessionId"
+  #       token_var: "token"
+  #       session_var: "sessionId"
+  #     login:
+  #       # 直接账号密码，不走滑块
+  #       type: password
+  #       path: "/api/auth/login"
+  #       method: "POST"
+  #       username_field: "account"
+  #       password_field: "pwd"
+  #       password_md5: False
+  #       data:
+  #         username: "${DEMO_USERNAME:demo}"
+  #         password: "${DEMO_PASSWORD:demo123}"
+
+  #   # 演示"自定义登录函数"怎么接
+  #   ticket:
+  #     host: "https://api.example.invalid"
+  #     is_need_login: True
+  #     label: "示例商城（自定义登录）"
+  #     auth:
+  #       token_header: "token"
+  #       session_header: "sessionId"
+  #       token_var: "token"
+  #       session_var: "sessionId"
+  #     login:
+  #       type: custom
+  #       custom_method: "adapters.demo.login"
+  #       data:
+  #         username: "${DEMO_USERNAME:demo}"
+  #         password: "${DEMO_PASSWORD:demo123}"
+
+  #   # 演示"有前端的系统"（走滑块）怎么接
+  #   web:
+  #     host: "https://api.example.invalid"
+  #     is_need_login: True
+  #     label: "示例商城（有前端）"
+  #     web_url: "https://admin.example.invalid"
+  #     login_page: "https://admin.example.invalid/login"
+  #     auth:
+  #       token_header: "token"
+  #       session_header: "sessionId"
+  #       token_var: "token"
+  #       session_var: "sessionId"
+  #     slider:
+  #       init_path: "/api/slider/init"
+  #       verify_path: "/api/slider/verify"
+  #       verify_query:
+  #         type: "LOGIN"
+  #     login:
+  #       type: slider

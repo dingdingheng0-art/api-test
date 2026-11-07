@@ -1,0 +1,97 @@
+{
+  "openapi": "3.0.3",
+  "info": { "title": "订单中心 API", "version": "1.0.0" },
+  "servers": [{ "url": "https://admin-api.pickmall.cn" }],
+  "paths": {
+    "/manager/statistics/order": {
+      "get": {
+        "tags": ["statistics"],
+        "summary": "订单统计",
+        "description": "按统计周期查订单数据",
+        "parameters": [
+          {
+            "name": "searchType", "in": "query", "required": true,
+            "description": "统计周期", "schema": { "type": "string", "enum": ["LAST_SEVEN", "LAST_THIRTY"] }
+          },
+          { "name": "pageSize", "in": "query", "schema": { "type": "integer", "default": 10 } }
+        ],
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": { "type": "integer", "example": 200 },
+                    "success": { "type": "boolean", "example": true },
+                    "message": { "type": "string", "example": "ok" },
+                    "result": {
+                      "type": "object",
+                      "properties": {
+                        "total": { "type": "integer" },
+                        "items": { "type": "array", "items": { "type": "object" } }
+                      }
+                    }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manager/order/list": {
+      "post": {
+        "tags": ["order"],
+        "summary": "订单列表",
+        "parameters": [
+          { "name": "accesstoken", "in": "header", "schema": { "type": "string" } }
+        ],
+        "requestBody": {
+          "required": true,
+          "content": {
+            "application/json": {
+              "schema": {
+                "type": "object",
+                "required": ["orderNo"],
+                "properties": {
+                  "orderNo": { "type": "string", "example": "SO202401010001" },
+                  "status": { "type": "integer", "example": 1 },
+                  "pageSize": { "type": "integer", "example": 20 }
+                }
+              }
+            }
+          }
+        },
+        "responses": {
+          "200": {
+            "description": "OK",
+            "content": {
+              "application/json": {
+                "schema": {
+                  "type": "object",
+                  "properties": {
+                    "code": { "type": "integer", "example": 200 },
+                    "success": { "type": "boolean", "example": true },
+                    "result": { "type": "object", "properties": { "list": { "type": "array" } } }
+                  }
+                }
+              }
+            }
+          }
+        }
+      }
+    },
+    "/manager/user/{userId}/detail": {
+      "get": {
+        "tags": ["user"],
+        "summary": "用户详情",
+        "parameters": [
+          { "name": "userId", "in": "path", "required": true, "schema": { "type": "integer" } }
+        ],
+        "responses": { "200": { "description": "OK" } }
+      }
+    }
+  }
+}

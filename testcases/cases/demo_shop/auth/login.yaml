@@ -1,0 +1,49 @@
+# ============================================================================
+# 第二个系统的示例用例
+#
+# **这个文件是演示多系统兼容怎么用** —— 地址是假的（example.invalid），
+# 跑起来必然连接失败，这是故意的。
+#
+# 它想说明的是：换系统时你要改的东西只有两处
+#   1) configs/config.yaml 里的 projects.demo_shop 那段（地址、登录方式、鉴权头）
+#   2) 这个目录里的用例（接口路径、断言）
+#
+# 框架代码一行都不用动。
+#
+# 另外注意这里的几个不同点（跟 mall4j 对比）：
+#   - 鉴权头叫 ``token``，不是 ``accesstoken`` —— 框架按项目档案自动带上
+#   - 会话标识叫 ``sessionId`` —— 同上
+#   - 登录方式是「直接账号密码」，没有滑块
+#   - token 变量是 {{demo_shop.token}}（变量名跟着项目名走）
+# ============================================================================
+
+status: debugged
+name: 正向-账号密码登录
+description: 登录接口（正向：账号密码正确，返回 token）
+
+# 这个示例指向的是假地址（example.invalid），所以默认跳过。
+# 接入你真正的系统时，把下面这行删掉即可。
+skip: "示例项目用的是假地址，接入真实系统后删掉这行"
+
+allure:
+  epic: 示例商城（演示多系统兼容）
+  feature: 认证登录
+  story: 账号密码登录
+
+marks: [api, auth]
+
+steps:
+  - id: login
+    description: 登录
+    method: POST
+    path: /api/auth/login
+    data:
+      account: '{{tools.login_credential("demo_shop", "username")}}'
+      pwd: '{{tools.login_credential("demo_shop", "password")}}'
+    assert:
+      - type: equal
+        field: code
+        expected: 200
+      # 这个系统 token 在 data.token 里（mall4j 是 result.accessToken）
+      - type: is not None
+        field: data.token

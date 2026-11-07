@@ -1,0 +1,157 @@
+# ============================================================================
+# 全局模块清单（可选配置）
+#
+# 这个文件**不是必填项** —— 不配也能跑。
+# 直接在 cases/<项目>/<模块>/module.yaml 里写描述也一样。
+#
+# 优先级：
+#   模块目录里的 module.yaml ＞ 本文件
+#
+# 模块目录里的 module.yaml 长这样：
+#
+#   name: statistics
+#   description: 首页统计类接口
+#   order: 50
+#   marks: [statistics]
+#
+# ⚠️ **接新系统时改这里** —— 把模块名换成你自己的，
+#    顺序（order）决定报告里模块的排列，数字小的排前面。
+# ============================================================================
+
+modules:
+  # ------------------------------------------------------------------------
+  # 被测项目：mall4j 管理后台
+  #
+  # 下面这份清单跟「接口测试用例_全量.xlsx」里的模块一一对应，
+  # 顺序按"先跑核心业务、最后跑边边角角"排的。
+  # ------------------------------------------------------------------------
+  mall4j:
+
+    # ---- 认证相关（最优先，其他模块都要依赖登录态）----
+    captcha_get:
+      order: 10
+      marks: [auth, captcha]
+      description: 获取图形验证码
+
+    captcha_check:
+      order: 11
+      marks: [auth, captcha]
+      description: 校验图形验证码
+
+    logOut:
+      order: 12
+      marks: [auth]
+      description: 退出登录
+
+    token_refresh:
+      order: 13
+      marks: [auth]
+      description: 刷新访问令牌
+
+    # ---- 商品管理 ----
+    prod_prod:
+      order: 20
+      marks: [prod]
+      description: 商品列表 / 详情 / 上下架
+
+    prod_prodComm:
+      order: 21
+      marks: [prod]
+      description: 商品评论管理
+
+    prod_prodTag:
+      order: 22
+      marks: [prod]
+      description: 商品标签管理
+
+    prod_category:
+      order: 23
+      marks: [prod]
+      description: 商品分类管理
+
+    prod_spec:
+      order: 24
+      marks: [prod]
+      description: 商品规格管理
+
+    # ---- 订单 ----
+    order_order:
+      order: 30
+      marks: [order]
+      description: 订单查询 / 详情 / 状态流转
+
+    # ---- 店铺 ----
+    shop_transport:
+      order: 41
+      marks: [shop]
+      description: 运费模板
+
+    shop_notice:
+      order: 42
+      marks: [shop]
+      description: 店铺公告
+
+    shop_pickAddr:
+      order: 43
+      marks: [shop]
+      description: 自提点管理
+
+    # ---- 用户 ----
+    admin_user:
+      order: 50
+      marks: [admin, user]
+      description: 会员（前台注册用户）列表 / 详情
+
+    sys_user:
+      order: 52
+      marks: [sys, user]
+      description: 系统用户管理
+
+
+    sys_role:
+      order: 53
+      marks: [sys]
+      description: 角色权限管理
+
+    sys_menu:
+      order: 54
+      marks: [sys]
+      description: 菜单管理
+
+    # ---- 营销 / 内容 ----
+    admin_area:
+      order: 61
+      marks: [admin]
+      description: 地区数据
+
+    admin_delivery:
+      order: 63
+      marks: [admin]
+      description: 配送设置
+
+    admin_file:
+      order: 64
+      marks: [admin]
+      description: 文件上传
+
+    admin_hotSearch:
+      order: 65
+      marks: [admin]
+      description: 热搜词管理
+
+    admin_indexImg:
+      order: 66
+      marks: [admin]
+      description: 首页轮播图
+
+    # ---- 系统配置 ----
+    sys_config:
+      order: 80
+      marks: [sys]
+      description: 系统参数配置
+
+    sys_log:
+      order: 81
+      marks: [sys]
+      description: 操作日志
+

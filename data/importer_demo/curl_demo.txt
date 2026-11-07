@@ -1,0 +1,13 @@
+curl 'https://admin-api.pickmall.cn/manager/statistics/order?searchType=LAST_SEVEN' \
+  -H 'accesstoken: eyJhbGciOiJIUzI1NiJ9.demo' \
+  -H 'uuid: c4f67488-d43a-4c6a-b8e6-86a40ea8a540' \
+  -H 'Content-Type: application/json' \
+  --compressed
+
+curl 'https://admin-api.pickmall.cn/manager/goods/detail' \
+  -X POST \
+  -H 'Content-Type: application/json' \
+  --data-raw '{"goodsId":1001,"name":"测试商品"}'
+
+curl 'https://admin-api.pickmall.cn/manager/permission/menu/memberMenu' \
+  -H 'accesstoken: eyJhbGciOiJIUzI1NiJ9.demo'

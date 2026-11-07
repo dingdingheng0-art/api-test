@@ -1,0 +1,60 @@
+# ============================================================================
+# 测试数据工厂注册表
+#
+# 每注册一个工厂，用例里就能用 ``operation_type: factory`` 造数据：
+#
+# 结构：
+#   <模块名>:
+#     <工厂名>:
+#       module:  工厂所在的 Python 模块
+#       class:   工厂类
+#       options: 传给工厂构造函数的参数（可选）
+#
+# 工厂名 = "<模块名>.<工厂名>"，比如 ``mall4j.order``
+#
+# ⚠️ **接新系统时改这里** —— 把下面的模块名 / 工厂名换成你的，
+#    并在 ``factory/<你的模块>.py`` 里实现对应的工厂类。
+# ============================================================================
+
+mall4j:
+  # 商品工厂 —— 造一条商品数据，测试订单接口时用得上
+  product:
+    module: factory.mall4j
+    class: ProductFactory
+    options:
+      db_alias: default
+
+  # 订单工厂 —— 造业务上的订单数据（走真实业务接口）
+  order:
+    module: factory.mall4j
+    class: OrderFactory
+
+  # Redis 凭证工厂 —— 造缓存凭证，测试登录态相关
+  redis_key:
+    module: factory.mall4j
+    class: RedisKeyFactory
+    options:
+      alias: default
+
+# ---------------------------------------------------------------------------
+# 示例项目（演示工厂怎么写，接新系统时可以照抄）
+#
+# 真实项目 mall4j 的工厂在 factory/mall4j.py 里；
+# 这个 demo_shop 版本是纯模板，接口路径是假的。
+# ---------------------------------------------------------------------------
+demo_shop:
+  product:
+    module: factory.demo_shop
+    class: ProductFactory
+    options:
+      db_alias: default
+
+  order:
+    module: factory.demo_shop
+    class: OrderFactory
+
+  redis_key:
+    module: factory.demo_shop
+    class: RedisKeyFactory
+    options:
+      alias: default
