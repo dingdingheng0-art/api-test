@@ -14,13 +14,29 @@
 
 from __future__ import annotations
 
+from pathlib import Path
+
 import pytest
 
+from framework.session_scope import targets_interface_tests
 from utils.logs.log_manager import log
+
+
+def _is_interface_session(config: pytest.Config) -> bool:
+    """跑单元测试时不要加载工厂、不要兜底清理。
+
+    **为什么**：根 conftest 无条件加载了本插件，``pytest unit_tests``
+    也会走到这里 —— 单测不需要工厂配置，更不该在 session 结束时
+    去清理"清理栈"、往 allure 目录里贴附件。
+    """
+    return targets_interface_tests(config)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     """session 开始：加载工厂。"""
+    if not _is_interface_session(config):
+        return
+
     from factory.base import load_factories
 
     try:
@@ -35,6 +51,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     """session 结束：兜底清理 + 贴报告。"""
+    if not _is_interface_session(session.config):
+        return
+
     from factory.cleanup import stack
 
     if stack.size == 0:
@@ -43,13 +62,47 @@ def pytest_sessionfinish(session: pytest.Session, exitstatus: int) -> None:
     log.info("清理栈里还有 %s 项待清理数据，开始兜底清理", stack.size)
     result = stack.run_all()
 
-    # 清理结果贴进 allure 报告
+    # 清理结果贴进 allure 报告。
+    #
+    # ⚠️ 这里**不能**用 ``allure.attach``：sessionfinish 时所有用例容器都已
+    # 关闭，reporter 取不到当前 executable，会抛 ``KeyError: None``（以前
+    # 被 ``except: pass`` 吞掉，清理结果从来没进过报告）。改成按 Allure 2
+    # 的文件格式，挂到最后一条已经落盘的结果上。
+    attached = False
     try:
-        from framework.allure_util import attach_json
+        from framework.allure_util import attach_json_to_latest_result
 
-        attach_json(result, name="测试数据清理结果")
-    except Exception:  # noqa: BLE001
-        pass
+        attached = attach_json_to_latest_result(
+            result,
+            name="测试数据清理结果",
+            results_dir=_allure_results_dir(session),
+        )
+    except Exception as exc:  # noqa: BLE001 - 贴附件失败不能影响退出码
+        log.warning("写测试数据清理附件失败: %s", exc)
+
+    if not attached:
+        # 没开 allure 报告，或者一条用例都没跑（没有结果可挂）——
+        # 至少把内容记到日志里，别让清理结果凭空消失。
+        log.info("测试数据清理结果: %s", result)
+
+    # 关掉工厂复用的数据库连接（不关的话进程退出前一直挂着）
+    try:
+        from factory.base import registry
+
+        registry.clear()
+    except Exception as exc:  # noqa: BLE001 - 关连接失败不影响退出码
+        log.warning("清理工厂注册表失败: %s", exc)
+
+
+def _allure_results_dir(session: pytest.Session) -> Path | None:
+    """取本轮 pytest 的 ``--alluredir`` 目录（没传就是 None）。"""
+    option = getattr(session.config.option, "allure_report_dir", None)
+    if not option:
+        return None
+    path = Path(str(option))
+    if not path.is_absolute():
+        path = Path(str(session.config.rootpath)) / path
+    return path
 
 
 @pytest.fixture(scope="session")

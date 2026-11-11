@@ -10,13 +10,19 @@
 方法     落库断言（加在哪）
 ======  ============================================================
 POST     ``SELECT COUNT(*) FROM t WHERE name = %s`` == 1
-        （加在后置的「查数据」步骤上）
+        （加在主步骤的「断言」列；旧版加在「后置」的「查数据」步骤上，
+        现在会被自动挪回主步骤）
 PUT      ``SELECT name FROM t WHERE pk = %s`` == 改后的名字
         （加在主步骤上 —— 响应返回时事务已经提交）
 DELETE   ``SELECT pk FROM t WHERE pk = %s`` 查不到
         （加在主步骤上；软删表改成 ``COUNT(*) WHERE pk=... AND
         delete_time IS NULL`` == 0）
 ======  ============================================================
+
+**落库断言只放主步骤，不放后置的验证步骤**：后置只做清理。断言放在后置里，
+失败会被报成 teardown 错误（而不是用例断言失败），主步骤先失败时还会多出
+一条误导性的失败；报告里也看不到"是哪个接口写坏了"。后置 DELETE 清理步骤上
+的「删后查不到」是清理验证，可以保留。
 
 表名 / 主键 / 名字列集中写在 :data:`MODULES` 里。mall4j 的表名带 ``tz_``
 前缀、列名是下划线风格（接口里的 ``hotSearchId`` → ``hot_search_id``），
@@ -503,11 +509,118 @@ def read_json(value: Any) -> Any:
     return json.loads(str(value).strip())
 
 
-def find_step(steps: list[Any], step_id: str) -> dict[str, Any] | None:
-    for step in steps:
-        if isinstance(step, dict) and str(step.get("id")) == step_id:
-            return step
-    return None
+def _is_db_assert(item: Any) -> bool:
+    """是不是一条落库断言（扁平 ``check=db`` 或内部 ``db_query*``）。"""
+    if not isinstance(item, dict):
+        return False
+    if str(item.get("check") or "").lower() == "db":
+        return True
+    kind = str(item.get("type") or "").lower()
+    return kind.startswith(("db_query", "mysql_query"))
+
+
+def _sql_of(item: dict[str, Any]) -> str:
+    return str(item.get("sql") or item.get("query") or "").strip()
+
+
+def _is_cleanup_step(item: Any) -> bool:
+    """后置里的纯清理动作（DELETE / factory_cleanup / db）。"""
+    if not isinstance(item, dict):
+        return False
+    op = str(item.get("operation_type") or "").lower()
+    if op in ("factory", "factory_cleanup", "db"):
+        return True
+    return str(item.get("method") or "").upper() == "DELETE"
+
+
+def _references_step(assertion: dict[str, Any], step_id: str) -> bool:
+    """断言是否引用了后置步骤自己的产出（``{{查数据.xxx}}``）。
+
+    这种断言不能挪到主步骤 —— 主步骤跑的时候那个变量还不存在。
+    """
+    if not step_id:
+        return False
+    needle = f"{{{{{step_id}."
+    texts = [
+        str(assertion.get("sql") or ""),
+        str(assertion.get("query") or ""),
+        json.dumps(assertion.get("params"), ensure_ascii=False),
+    ]
+    return any(needle in text for text in texts)
+
+
+def move_verification_db_asserts_out_of_teardowns(
+    teardowns: list[Any], main_asserts: list[dict[str, Any]]
+) -> tuple[int, int]:
+    """把后置**验证步骤**里的落库断言挪到主步骤，返回 ``(挪动数, 跳过的数)``。
+
+    后置 DELETE / factory_cleanup / db 这类清理步骤不动 —— 它们上面的
+    「删后查不到」是在验证清理结果。验证步骤（比如「查数据」GET）上的落库
+    断言才是放错位置。
+
+    引用了后置步骤自身结果的断言挪不了（主步骤跑的时候变量还不存在），
+    原样留下并计入 skipped，由审计继续提示。
+    """
+    moved = skipped = 0
+    for item in teardowns:
+        if not isinstance(item, dict) or _is_cleanup_step(item):
+            continue
+        step_id = str(item.get("id") or "")
+        asserts = item.get("assert")
+        if not isinstance(asserts, list):
+            continue
+        kept: list[Any] = []
+        for assertion in asserts:
+            if not _is_db_assert(assertion):
+                kept.append(assertion)
+                continue
+            if _references_step(assertion, step_id):
+                kept.append(assertion)
+                skipped += 1
+                continue
+            if not has_sql(main_asserts, _sql_of(assertion)):
+                main_asserts.append(assertion)
+            moved += 1
+        if len(kept) != len(asserts):
+            if kept:
+                item["assert"] = kept
+            else:
+                item.pop("assert", None)
+    return moved, skipped
+
+
+def move_db_asserts_out_of_teardowns(
+    teardowns: list[Any], target_sqls: set[str]
+) -> int:
+    """把后置步骤里指定 SQL 的落库断言摘掉，返回摘掉的数量。
+
+    旧版工具把 POST 的落库断言加在「后置」的「查数据」步骤上。后置只该做
+    清理：断言放在那里，失败会显示成 teardown 错误，主步骤失败时还会多出
+    一条误导性的失败。重跑本工具时顺手把这些断言挪回主步骤。
+
+    只摘 ``target_sqls`` 里的（本工具自己生成的那几条），手工写在别的后置
+    步骤上的断言（比如"删除后查不到"）不动 —— 那不是这里能安全搬的。
+    """
+    moved = 0
+    for item in teardowns:
+        if not isinstance(item, dict) or _is_cleanup_step(item):
+            continue
+        asserts = item.get("assert")
+        if not isinstance(asserts, list):
+            continue
+        kept = [
+            assertion
+            for assertion in asserts
+            if not (_is_db_assert(assertion) and _sql_of(assertion) in target_sqls)
+        ]
+        if len(kept) == len(asserts):
+            continue
+        moved += len(asserts) - len(kept)
+        if kept:
+            item["assert"] = kept
+        else:
+            item.pop("assert", None)
+    return moved
 
 
 def process_workbook(
@@ -528,7 +641,7 @@ def process_workbook(
     # 「接口」列不是所有工作簿都有；没有就退回模块级配置
     headers["接口"] = column_index(ws, "接口")
 
-    stats = {"cases": 0, "db_added": 0, "renamed": 0}
+    stats = {"cases": 0, "db_added": 0, "renamed": 0, "moved": 0}
 
     for row in range(2, ws.max_row + 1):
         if str(ws.cell(row, headers["用例状态"]).value or "").strip() != "debugged":
@@ -548,6 +661,28 @@ def process_workbook(
         # 所以表信息要按接口取，不能整个模块一把梭
         module = module_for_endpoint(module_name, api_path)
         changed = False
+
+        # ---- 后置验证步骤上的落库断言，先挪回主步骤 ----
+        #
+        # 后置 DELETE 清理步骤上的「删后查不到」不动（那是清理验证）；
+        # 「查数据」这类验证步骤上的断言全部收到主步骤。
+        teardowns = read_json(ws.cell(row, headers["后置"]).value) or []
+        asserts = read_json(ws.cell(row, headers["断言"]).value) or []
+        moved, skipped = move_verification_db_asserts_out_of_teardowns(
+            teardowns, asserts
+        )
+        if moved:
+            ws.cell(row, headers["后置"]).value = json.dumps(
+                teardowns, ensure_ascii=False
+            )
+            ws.cell(row, headers["断言"]).value = json.dumps(asserts, ensure_ascii=False)
+            stats["moved"] += moved
+            changed = True
+        if skipped:
+            print(
+                f"    ! {case_id} 有 {skipped} 条落库断言引用了后置步骤自身的结果，"
+                f"无法挪动"
+            )
 
         # ---- 先把 timestamp 命名换成 fixed ----（只对写操作的请求体）
         renaming = convert_timestamp_names(body, module_name, is_update=method == "PUT")
@@ -679,18 +814,29 @@ def process_workbook(
             if not name_expr:
                 print(f"    ! {case_id} 请求体里找不到固定名字，跳过落库断言")
                 continue
+            db_items = build_post_asserts(module, name_expr)
+
+            # 旧版把这两条加在「后置」的「查数据」步骤上。先摘干净，
+            # 保证落库断言只出现在主步骤 —— 后置只做清理。
             teardowns = read_json(ws.cell(row, headers["后置"]).value) or []
-            target = find_step(teardowns, "查数据")
-            if target is None:
-                print(f"    ! {case_id} 后置里没有「查数据」步骤，跳过落库断言")
-                continue
-            asserts = target.setdefault("assert", [])
-            for item in build_post_asserts(module, name_expr):
+            target_sqls = {item["sql"] for item in db_items}
+            moved = move_db_asserts_out_of_teardowns(teardowns, target_sqls)
+            if moved:
+                ws.cell(row, headers["后置"]).value = json.dumps(
+                    teardowns, ensure_ascii=False
+                )
+                stats["moved"] += moved
+                changed = True
+
+            asserts = read_json(ws.cell(row, headers["断言"]).value) or []
+            for item in db_items:
                 if not has_sql(asserts, item["sql"]):
                     asserts.append(item)
                     added.append(item)
             if added:
-                ws.cell(row, headers["后置"]).value = json.dumps(teardowns, ensure_ascii=False)
+                ws.cell(row, headers["断言"]).value = json.dumps(
+                    asserts, ensure_ascii=False
+                )
         elif method == "PUT":
             name_expr = find_expr(body.get(module["name_field"]))
             pk_expr = id_expr_from_body(body)
@@ -778,7 +924,7 @@ def main() -> int:
         print("（dry-run，不写文件）")
 
     client = open_db_client()
-    total = {"cases": 0, "db_added": 0, "renamed": 0}
+    total = {"cases": 0, "db_added": 0, "renamed": 0, "moved": 0}
     for path in files:
         stats = process_workbook(path, path.parent.name, args.dry_run, client)
         if not stats or not stats["cases"]:
@@ -787,12 +933,15 @@ def main() -> int:
             total[key] += stats[key]
         print(
             f"  {path.parent.name:16} 用例 {stats['cases']:3}   "
-            f"落库断言 +{stats['db_added']:3} 条   命名固定化 {stats['renamed']:2} 处"
+            f"落库断言 +{stats['db_added']:3} 条   "
+            f"后置挪回主步骤 {stats['moved']:2} 条   命名固定化 {stats['renamed']:2} 处"
         )
 
     print(
         f"\n合计：{total['cases']} 条用例被加强，"
-        f"落库断言 +{total['db_added']} 条，命名固定化 {total['renamed']} 处"
+        f"落库断言 +{total['db_added']} 条，"
+        f"从后置挪回主步骤 {total['moved']} 条，"
+        f"命名固定化 {total['renamed']} 处"
     )
     return 0
 

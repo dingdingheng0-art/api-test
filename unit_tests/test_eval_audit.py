@@ -91,6 +91,32 @@ def test_audit_masks_secrets():
     assert args["project"] == "mall4j"  # 普通参数照常记
 
 
+def test_audit_masks_secrets_in_nested_args():
+    """``create_case`` 的 request_headers 是嵌套 dict —— 里面的 token 也得抹。"""
+    from ai.agent import audit_log
+
+    audit_log.record(
+        "create_case",
+        ok=True,
+        duration_ms=1,
+        arguments={
+            "project": "mall4j",
+            "request_headers": {
+                "Authorization": "Bearer eyJhbGciOi",
+                "Content-Type": "application/json",
+            },
+            "steps": [{"headers": {"X-Api-Key": "sk-live-1"}, "name": "查询"}],
+        },
+    )
+
+    args = audit_log.recent()[0]["args"]
+    assert args["project"] == "mall4j"
+    assert args["request_headers"]["Authorization"] == "***"
+    assert args["request_headers"]["Content-Type"] == "application/json"
+    assert args["steps"][0]["headers"]["X-Api-Key"] == "***"
+    assert args["steps"][0]["name"] == "查询"
+
+
 def test_audit_truncates_long_arguments():
     from ai.agent import audit_log
 
@@ -717,6 +743,18 @@ def test_every_task_has_expect():
 
     for task in load_tasks():
         assert task.get("expect"), f"{task['id']} 没写 expect"
+
+
+def test_load_tasks_rejects_non_object_root(tmp_path):
+    """评测集根节点是列表时 ``data.get`` 抛 AttributeError —— 给清楚的 ValueError。"""
+    from ai.evals.runner import load_tasks
+
+    path = tmp_path / "tasks.yaml"
+    path.write_text("- id: X-1\n  task: x\n", encoding="utf-8")
+
+    with pytest.raises(ValueError) as exc:
+        load_tasks(path)
+    assert "根节点" in str(exc.value)
 
 
 def test_validate_catches_unknown_tool_and_field():

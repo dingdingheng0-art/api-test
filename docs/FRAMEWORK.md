@@ -47,20 +47,16 @@
 依赖统一维护在项目根目录的 **`requirements.txt`**（唯一入口）：
 
 ```powershell
-cd C:\Users\17358\Desktop\PythonProject
-
-uv pip install -r requirements.txt
+# 在项目根目录执行
+.venv\Scripts\python.exe -m pip install -r requirements.txt
 ```
 
-或者用 pip：
-
-```powershell
-pip install -r requirements.txt
-```
+> ⚠️ Windows 上不要用裸 `python` / `pip` —— 系统 PATH 上可能是商店占位符（静默退出 49）。
+> 统一用 `.venv\Scripts\python.exe`。
 
 > 装完还要装浏览器内核（滑块识别要开无头浏览器）：
 > ```powershell
-> playwright install chromium
+> .venv\Scripts\python.exe -m playwright install chromium
 > ```
 
 ### 第 2 步：自检
@@ -86,12 +82,12 @@ python scripts/run.py             # 跑全部
 ### 用例目录：一个模块一个文件夹
 
 ```
-cases_excel/mall4j/statistics/     ← Excel 用例（平台默认）
-├── module.yaml                       ← 模块说明 / 标签 / 执行顺序
-└── statistics.xlsx                   ← Excel 用例
+cases_excel/mall4j/admin_area/     ← Excel 用例（平台默认）
+├── module.yaml                       ← 模块说明 / 标签
+└── admin_area.xlsx                   ← Excel 用例
 
-cases/mall4j/statistics/            ← YAML 用例（老格式，还能用）
-├── module.yaml                       ← 模块说明 / 标签 / 执行顺序
+cases/mall4j/some_module/           ← YAML 用例（老格式，还能用）
+├── module.yaml                       ← 模块说明 / 标签
 ├── order.yaml                        ← YAML 用例
 └── data/                             ← YAML 的测试数据
     └── order.yaml
@@ -121,24 +117,25 @@ cases/mall4j/statistics/            ← YAML 用例（老格式，还能用）
 ### `module.yaml`（模块级）
 
 ```yaml
-name: statistics
-label: 首页统计          # 报告里显示的模块名
-description: 首页统计、运营报表
-order: 50              # 执行顺序，数字小的先跑
-marks: [statistics]    # 模块级标签，整个模块的用例都带上
+name: admin_area
+label: 地区管理          # 报告里显示的模块名
+description: 地区增删改查
+marks: [admin_area, admin]    # 模块级标签，整个模块的用例都带上
+# ⚠️ 不要写 order —— 执行顺序统一在 configs/modules.yaml 里配
 ```
 
 > 也可以写在全局的 `configs/modules.yaml` 里，两边都能用，
 > **模块目录里的 `module.yaml` 优先级更高**（就近原则）。
+> 但 `order` 只应该写在全局文件里，否则会把全局顺序盖掉。
 
 ### `order.yaml`（接口定义）
 
 ```yaml
-name: statistics_order
+name: order_statistics
 description: 订单统计（不同统计周期）
 
 allure:
-  epic: mall4j 管理后台
+  # 不要写 epic —— 项目层由框架按环境解析
   feature: 首页统计
   story: 订单统计
 
@@ -278,9 +275,9 @@ cases/
 现在有两条筛选用例的方式：
 
 ```powershell
-python scripts/run.py --project mall4j       # 按项目筛
-python scripts/run.py --module statistics       # 按模块筛
-python scripts/run.py --case-file cases\mall4j\user\test_user_info.yaml
+python scripts/run.py --project mall4j                    # 按项目筛
+python scripts/run.py --module admin_area                 # 按模块筛
+python scripts/run.py --case-file testcases\cases_excel\mall4j\admin_area\admin_area.xlsx
 ```
 
 ---
@@ -509,8 +506,8 @@ python scripts/run.py --case-source both           # 两边都跑（迁移过渡
 **第 1 步：生成模板**
 
 ```powershell
-python scripts/new_case.py --module statistics              # 给 mall4j 建
-python scripts/new_case.py --module order --project demo_shop   # 给别的系统建
+python scripts/new_case.py --module order_order                    # 给 mall4j 建
+python scripts/new_case.py --module order --project demo_shop      # 给别的系统建
 ```
 
 会在 `testcases/cases_excel/<项目>/<模块>/<模块>.xlsx` 生成一个模板，
@@ -526,14 +523,13 @@ python scripts/new_case.py --module order --project demo_shop   # 给别的系�
 > 每列的说明在**表头的批注**里 —— 鼠标悬停表头就能看到，不用翻文档。
 > 「请求方法」列有下拉选项，不用手打。
 
-> **模板里的鉴权头是按项目自动填的** —— 给 `demo_shop` 建模板时，
-> 示例里写的是 `token: {{demo_shop.token}}`，不是 mall4j 的
-> `accesstoken`。换系统不用手动改示例。
+> **模板里的鉴权头是按项目自动填的** —— 头名取自项目档案的 `auth.token_header`，
+> 变量名按项目名拼（`{{<项目名>.token}}`）。换系统不用手动改示例。
 
 > ⚠️ **已存在的文件不会被覆盖** —— 里面可能有你写好的几十条用例。
 > 确实要重新生成，加 `--force`：
 > ```powershell
-> python scripts/new_case.py --module statistics --force
+> python scripts/new_case.py --module order_order --force
 > ```
 
 **第 2 步：照着第 2 行的示例填**
@@ -656,7 +652,7 @@ Excel 只管「模块」和「场景」两层，上面那层交给框架。
 #### 把现有 YAML 转成 Excel
 
 ```powershell
-python scripts/to_excel.py --module statistics    # 导一个模块
+python scripts/to_excel.py --module admin_area    # 导一个模块
 python scripts/to_excel.py --all                   # 导所有模块
 ```
 
@@ -690,7 +686,7 @@ python scripts/to_excel.py --all                   # 导所有模块
 | `case_id` | 是 | 用例编号，唯一 |
 | 模块 | 是 | 业务模块，报告里分组用 |
 | 标签 | 否 | 逗号分隔，变成 pytest 标记 |
-| 用例名称 | 是 | pytest 风格的函数名，如 `test_xxx` |
+| 用例名称 | 是 | 业务名，`模块中文名 - 业务功能（场景）`，如 `地区管理 - 修改地区（正常请求）`（**不是** pytest 函数名；旧版本文档写的 `test_xxx` 已作废） |
 | 优先级 | 是 | P0/P1/P2/P3 → allure 严重级别 + `p0`~`p3` 标记 |
 | 用例标题 | 是 | 中文标题，报告里显示 |
 | 接口 | 是 | 接口路径，拼到 base_url 后 |
@@ -893,14 +889,15 @@ CSV 第一行是字段名，每行是一组参数。支持 `.csv` / `.json`，
 ### 模块标签（module.yaml）
 
 ```yaml
-# testcases/cases/mall4j/flow/module.yaml
-name: flow
-description: 业务流测试
-order: 60
-marks: [flow]
+# testcases/cases_excel/mall4j/admin_area/module.yaml
+name: admin_area
+marks: [admin_area, admin]
 ```
 
-配了 `marks: [flow]`，那 `mall4j/flow/` 下**所有**用例都会自动带上 `flow` 标签。
+配了 `marks: [admin, admin_area]`，那 `mall4j/admin_area/` 下**所有**用例都会自动带上这两个标签。
+
+> ⚠️ **模块 `module.yaml` 里不要写 `order`**：它的优先级高于 `configs/modules.yaml`，
+> 写死会把全局的模块执行顺序盖掉。排序统一在 `configs/modules.yaml` 里维护。
 
 全局集中管理也可以（老写法，一样生效）：
 
@@ -1262,7 +1259,7 @@ assert:
 |---|---|---|
 | 新增 | `code`；后置"查数据"：`total >= 1`、`records` 非空、`records[0]` 各字段 `==` 造数时的值 | API-149 |
 | 修改 | `code`；**主步骤用精确 id**（`find_id_by_fixed`，不要 `max_id`）；后置"验数据"逐字段比对修改后的值 | API-148 |
-| 删除 | 删前查得到，删后 `info` 返回 `data is null` 或查库 `db_query_not_exists` | API-148 / API-149 的「确认已删」后置步骤；API-150（disabled） |
+| 删除 | 删前查得到；删除主步骤断言 `info` 返回 `data is null` 或查库 `db_query_not_exists`（**不要放到后置**） | API-148 / API-149；API-150（disabled） |
 | 分页 | `code`、`data.current` / `size` / `total` / `pages` / `records` 存在，`current` / `size` 等于请求参数 | API-151 |
 | 详情（正常） | `code`、`data` 存在、主键 `==` 路径里的 id、契约字段逐个 `exists` | API-152 |
 | 详情（查不到） | `code`、`data is null` | API-153 |
@@ -1338,8 +1335,12 @@ assert:
 - 现成的样板：**API-154「查库连通性」**（`SELECT 1` + 表数量 > 0），
   以及 API-148 / API-149 / API-152 / API-153 里的真实落库断言。
 - 删除类断言用 `db_query_not_exists`；存在类用 `db_query_exists`。
-- 查库断言**放在后置步骤里**时，如果前面有造数/查数步骤，`params` 里
-  可以直接写 `{{tools.find_id_by_fixed(...)}}` —— 变量解析会先跑。
+- 查库断言**放在主步骤的断言里，不要放到 teardowns 的验证步骤上**（比如
+  「查数据」GET）。后置只做清理：验证类断言放在那里，失败会被报成 teardown
+  错误（而不是用例断言失败），主步骤先失败时还会多一条误导性的失败。
+  例外：后置 **DELETE 清理步骤**上的「删后查不到」是在验证清理结果，可以保留。
+  需要引用前置造数/查数的结果时，直接在 `params` 里写
+  `{{tools.find_id_by_fixed(...)}}` —— 变量解析会先跑。
 
 ### 推广到其它模块的验收清单
 
@@ -1383,7 +1384,7 @@ assert:
 
 | 方法 | 断言 | 加在哪 |
 |---|---|---|
-| POST | `SELECT COUNT(*) FROM t WHERE name = %s` == 1，且主键 `exists` | 后置「查数据」步骤 |
+| POST | `SELECT COUNT(*) FROM t WHERE name = %s` == 1，且主键 `exists` | 主步骤（旧版放在后置的会自动挪回） |
 | PUT | `SELECT name FROM t WHERE pk = %s` == 改后的名字 | 主步骤 |
 | DELETE | `SELECT pk FROM t WHERE pk = %s` 查不到 | 主步骤 |
 | DELETE（软删表） | `COUNT(*) WHERE pk = %s AND delete_time IS NULL` == 0 | 主步骤 |
@@ -1492,18 +1493,17 @@ value: '{{tools.compare(goods_stats.result.0.price, goods_detail.result.price)}}
 - `a.0.b` 和 `a[0].b` 两种下标写法都支持
 - 支持切片：`tools.pluck(view.result, "date")[-7:]`（取最近 7 天）
 
-### 现成的业务流用例
+### 业务流用例怎么放
 
-在 `testcases/cases/mall4j/flow/`：
+参考样例（当前仓库未内置，按下面的结构自己放即可）：
 
 | 用例 | 验什么 |
 |---|---|
 | `dashboard_consistency.yaml` | 概览 UV == 访问量明细之和；订单金额 == 店铺金额 |
 | `period_consistency.yaml` | 近七天 / 近三十天 的重叠区间逐日相等；日期集合一致 |
 | `auth_chain.yaml` | 登录后一路通（用户/菜单/统计/商品列表/商品详情）；换坏 token 必须 403 |
-| `goods_stats_link.yaml` | 统计里的商品，拿到商品模块查详情，单价和名称必须对得上 |
 
-跑它们：
+放好之后按模块跑：
 
 ```powershell
 python scripts/run.py --module flow
@@ -2000,19 +2000,16 @@ python scripts/run.py --report allure
 
 ```powershell
 python scripts/serve_report.py                    # 打开最新那份
-python scripts/serve_report.py reports\allure_20261030_082735
+python scripts/serve_report.py reports\allure_20261111_093000   # 指定某一份
 python scripts/serve_report.py --port 8888        # 指定端口
 ```
 
 > 服务是**独立进程**，跑完测试退出后依然能看。按 Ctrl+C 停止。
 
-**本机已装好** allure 命令行 2.29.0（在 `D:\ALLURECOMMANDLINE\allure-2.29.0\`），
-框架会自动找到它，不用额外配置。
-
-其他机器的话，装好 allure 命令行后指定路径（框架会优先用这个）：
+allure 命令行装在 PATH 上时框架会自动找到；装在别处就指定路径：
 
 ```powershell
-$env:APITEST_ALLURE_BIN = "D:\ALLURECOMMANDLINE\allure-2.29.0\bin\allure.bat"
+$env:APITEST_ALLURE_BIN = "<allure解压目录>\bin\allure.bat"
 ```
 
 #### ⚠️ allure 版本兼容（踩过的坑）
@@ -2027,16 +2024,12 @@ Unrecognized field "titlePath" (class io.qameta.allure.model.TestResult)
 ```
 
 **框架已经处理了**：检测到命令行版本 < 2.20 时，会自动把新字段剔掉再生成，
-老版本也能出正常报告（本机之前就是 2.13.5，靠这个兜底才没出空报告）。
+老版本也能出正常报告。
 
 **更好的做法是用新版本**（2.29 或更新），能显示更完整的信息
-（用例路径层级、失败重试记录等）。本机已经装好 2.29.0：
+（用例路径层级、失败重试记录等）。
 
-```
-D:\ALLURECOMMANDLINE\allure-2.29.0\
-```
-
-其他机器安装（GitHub 下载慢的话走 Maven 中央仓库，这个源更稳）：
+安装（GitHub 下载慢的话走 Maven 中央仓库，这个源更稳）：
 
 ```powershell
 # GitHub（官方）
@@ -2049,7 +2042,7 @@ https://repo1.maven.org/maven2/io/qameta/allure/allure-commandline/2.29.0/allure
 解压后指定路径即可：
 
 ```powershell
-$env:APITEST_ALLURE_BIN = "D:\ALLURECOMMANDLINE\allure-2.29.0\bin\allure.bat"
+$env:APITEST_ALLURE_BIN = "<allure解压目录>\bin\allure.bat"
 ```
 
 **排查小技巧**：报告是空的时候，先手动跑一次命令看看有没有 Java 报错：
@@ -2143,38 +2136,44 @@ $env:APITEST_LOG_KEEP_DAYS = 3   # 改保留天数；填 0 或负数 = 不清理
 
 ```powershell
 # ---- 环境 ----
-uv pip install -r requirements.txt      # 装依赖
-playwright install chromium            # 装浏览器内核
+.venv\Scripts\python.exe -m pip install -r requirements.txt   # 装依赖
+.venv\Scripts\python.exe -m playwright install chromium       # 装浏览器内核
 
-# ---- 跑用例 ----
+# ---- 跑用例（统一用 .venv 里的 python）----
 python scripts/run.py --list           # 列出用例
 python scripts/run.py --marks          # 列出所有标签 + 每条多少用例
 python scripts/run.py                  # 跑全部
 python scripts/run.py --env pre        # 指定环境
 python scripts/run.py --project mall4j   # 按项目筛
-python scripts/run.py --module statistics   # 按模块筛
-python scripts/run.py -k user_info     # 按关键字筛（支持中文）
+python scripts/run.py --module admin_area   # 按模块筛
+python scripts/run.py --case-id API-168     # 精确到一条
+python scripts/run.py -k "新增地区"     # 按关键字筛（支持中文）
 python scripts/run.py --list -m smoke  # 先看这个标签下有哪些用例
 python scripts/run.py -m smoke         # 按标签筛
 python scripts/run.py -m "smoke or p0" # 多个标签
 python scripts/run.py -m "not slow"    # 排除
 python scripts/run.py --report allure  # 出报告
+python scripts/run.py --report none    # 不出报告（最快）
 
-# ---- 切用例来源 ----
+# ---- 切用例来源 / 状态 ----
 python scripts/run.py --case-source yaml --list    # 这次只列 YAML 用例
 python scripts/run.py --case-source both           # 两边都跑（迁移过渡期）
-python scripts/run.py --run-draft           # 连未调试的用例一起跑（本地调试用）
+python scripts/run.py --run-draft                  # 连未调试的用例一起跑
 
 # ---- 维护用例 ----
-python scripts/new_case.py --module statistics   # 生成 Excel 模板
-python scripts/to_excel.py --module statistics    # YAML 导出成 Excel
-python scripts/to_excel.py --all                  # 全部模块导出
-python tools/maint/split_flat_excel.py    # 拆分「大表」格式的全量用例
+python scripts/new_case.py --module order_order    # 生成 Excel 模板
+python scripts/to_excel.py --module admin_area     # YAML 导出成 Excel
+python scripts/to_excel.py --all                   # 全部模块导出
+python tools/maint/split_flat_excel.py             # 拆分「大表」格式的全量用例
+
+# ---- CI ----
+python ci/run_ci.py --env pre --mark smoke
+python ci/run_ci.py --env pre --dry-run            # 只看会跑什么
 
 # ---- 直接用 pytest ----
 pytest -v                              # 框架单测（testpaths = unit_tests）
 pytest testcases -m smoke              # 按 mark 筛（用 run.py 更省事）
-python scripts/run.py --module shop_transport  # 按模块跑接口用例
+python scripts/run.py --module admin_area   # 按模块跑接口用例
 ```
 
 ---
@@ -2268,6 +2267,25 @@ python -m pytest unit_tests/test_knowledge.py -q      # 知识层
 - **写类工具全部落在 `ask`**：写文件的工具**不允许**出现在 `allow` 里，
   这条有回归测试（`test_write_tools_are_ask_not_allow`）盯着，见第十九节。
 - **`query_db` 只读**：SQL 白名单 + 只读数据库账号，两道闸门。
+  `SELECT` 开头不等于只读 —— `SELECT ... INTO OUTFILE/DUMPFILE` 会往
+  服务器写文件，按子句单独拦；占位参数走 `params` 数组绑定（`%s`），
+  不再让模型拼字符串。
+- **MCP resources 不是任意文件读取接口**：`apitest://cases/<相对路径>`
+  会拒绝 `..`、绝对路径和符号链接逃逸（解析后用 `relative_to` 复核），
+  且只放行 `.yaml/.yml/.xlsx/.xlsm`。`apitest://schema/{alias}` 同理 ——
+  alias 会被拼进 glob，`*` / `?` / 路径分隔符一律按白名单拒掉，实际匹配
+  也是拿 `*.json` 列表逐个比文件名，不拿用户输入当模式串。
+- **stdio 入口只收 JSON 对象**：合法 JSON 不等于合法消息。`[1,2]` /
+  `"hi"` / `5` 能过 `json.loads`，但主循环对它取 `.get` 会
+  `AttributeError`，而那句不在 `try` 里 —— 服务直接退出、客户端断开。
+  `read_message` 现在把非对象转成 `-32600` 错误，后续请求照常处理。
+- **缓存的 JSON 也要校验根节点类型**：同一条教训在工具层重复出现 ——
+  OpenAPI 快照、表结构快照、`result.json`、allure 结果文件、审计日志行。
+  `json.loads` 成功只说明是 JSON，根节点是 `[]` / `5` / `"x"` 时，下一行
+  `.get(...)` 会抛 `AttributeError`（不是 `ValueError`，原有 `except` 接不住），
+  表现是整片工具报错或整轮归因中断。现在这些读入口一律先
+  `isinstance(data, dict)`：快照类当「没有」处理，OpenAPI 根对象不对直接
+  抛带 `hint` 的 `ToolError`，allure / 审计日志跳过错行。
 - **错误必须带 `hint`**：只说"失败了"模型会重试同一个错。
 
 ---
@@ -2410,8 +2428,23 @@ find_field_mapping("areaName", endpoint="PUT /admin/area")
 | `read_case_assertions` | read | 读断言，同时给内部格式和扁平格式对照 |
 | `propose_case_change` | read | 只算 diff（added / removed）+ 削弱检查，**不落盘** |
 | `apply_case_change` | write_case | 落盘：备份 → 写 → 复验 → 失败回滚 |
-| `set_case_status` | write_case | draft / debugged / disabled / broken |
+| `set_case_status` | write_case | draft / debugged / disabled / broken；转 debugged 要核对「跑通过」凭据 |
 | `create_case` | write_case | 往模块 Excel 追加一条，默认 draft |
+
+**转 `debugged` 有凭据闸**：`run_cases` 每次整体通过（退出码 0、`total > 0`、
+failed/error/skipped 全 0、`total` 等于按 pytest 收集口径算出的候选条数）后，
+把跑过的用例连同内容指纹写进 `.cache/verify_ledger.json`；
+`set_case_status(debugged)` 核对「有记录 + 文件对得上 + 指纹没变」，
+不满足就拒绝。指纹按单条用例算并排除 `status`（转正本身就是改 status）。
+确实无法执行时用 `force=true`，但必须写 `note`。
+
+**状态写没写进去要复验**：YAML 的 `status` 是文本替换出来的。以前取
+「第一个 `status:` 匹配」，步骤请求体里的 `data.status`（比如调上架/下架接口）
+排在前面就会被改成 `debugged` —— 文件还能解析、用例还在、`CaseValidator`
+也不报错，工具返回「写成功」，用例本身仍是 draft，接口参数反而被改坏。
+现在：先用 `yaml.safe_load` 确认键在「用例本体那一层」，再按该层缩进定位；
+没有这个键时插到 `testcase:` 下面（扁平用例才插顶格）。写完 `_verify`
+额外核对「文件里读出来的状态确实是它」，对不上就回滚并报错。
 
 写类工具在 `.claude/settings.json` 里走 `ask`，每次落盘都要人点确认。
 智能体拿到的是「提交改动」的能力，不是「随便改文件」的能力。
@@ -2582,6 +2615,10 @@ python scripts/run_eval.py --only EVAL-005  # 只跑某几条
    一次会话累计超过 50 条拒绝（`ai/agent/tools/run_budget.py`）
 4. 最后一条：工具层的闸只能"拦住"，不能"让它知道该问" ——
    在系统提示里加了一条「用户要跑全部时先报条数和代价，请他确认」
+5. 条数统计本身也能被"弄坏"：目录里只要有一个读不了的文件，
+   `_count_matching` 以前直接 `return 0`，单次闸和累计闸**同时**消失
+   → 改成 fail-closed：`case_id` 按编号直接数（不依赖读文件），
+   其余筛选直接报错；`_common._load_file` 加了 `strict` 并缓存读失败
 
 每一层都是评测跑出来的，不是想出来的。**这就是评测集的价值：
 它把"模型会怎么绕"变成可复现的回归用例。**
@@ -2596,8 +2633,11 @@ python scripts/run_eval.py --only EVAL-005  # 只跑某几条
  "args":{"module":"admin_area","timeout":600}}
 ```
 
-- **参数脱敏**：名字里带 token / password / secret / cookie / session 的值
-  一律记成 `***`。审计日志是长期保留的，落盘就该按敏感级别对待。
+- **参数脱敏（递归）**：名字里带 token / password / secret / authorization /
+  api_key / cookie / session 的值一律记成 `***`。匹配前先把 `-`/`_`/空格
+  去掉，`X-Api-Key` 和 `api_key` 才当同一个词；嵌套 dict/list 也要走进去 ——
+  `create_case(request_headers={"Authorization": ...})` 里的 token 就在第二层。
+  审计日志是长期保留的，落盘就该按敏感级别对待。
 - **写失败只告警**：磁盘满、文件被占用都不该让一次正常调用失败。
   "因为记不了账所以不办事"是本末倒置。
 - **滚动保留**：单文件 5MB，保留 3 个历史文件。

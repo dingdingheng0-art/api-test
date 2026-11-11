@@ -93,10 +93,11 @@ def set_case_status(
     status: str,
     project: str = "",
     note: str = "",
+    force: bool = False,
 ) -> dict[str, Any]:
     """改用例状态（draft / debugged / disabled / broken）。"""
     result = case_io.apply_status_change(
-        case_id, status, project=project, note=note
+        case_id, status, project=project, note=note, force=force
     )
     return ok(**result)
 
@@ -109,6 +110,7 @@ def create_case(
     title: str,
     assertions: list[dict[str, Any]],
     api_name: str = "",
+    case_name: str = "",
     request_data: Any = None,
     request_headers: Any = None,
     query_params: Any = None,
@@ -116,6 +118,7 @@ def create_case(
     marks: str = "",
     setups: Any = None,
     teardowns: Any = None,
+    steps: Any = None,
 ) -> dict[str, Any]:
     """新建一条 Excel 用例（默认 draft）。"""
     result = case_io.create_case(
@@ -126,6 +129,7 @@ def create_case(
         title=title,
         assertions=assertions,
         api_name=api_name,
+        case_name=case_name,
         request_data=request_data,
         request_headers=request_headers,
         query_params=query_params,
@@ -133,6 +137,7 @@ def create_case(
         marks=marks,
         setups=setups,
         teardowns=teardowns,
+        steps=steps,
     )
     return ok(**result)
 
@@ -246,7 +251,8 @@ TOOLS = [
         description=(
             "改用例状态：draft（未调试，CI 不跑）/ debugged（调试通过，CI 跑）/ "
             "disabled（临时下线）/ broken（已知有问题）。"
-            "只有用例真的跑通过才改成 debugged。"
+            "改成 debugged 会核对「跑通过」凭据：必须先用 run_cases 跑（整体通过后"
+            "自动记账），没记录或记录之后又改过用例，都会被拒绝。"
         ),
         params_schema={
             "type": "object",
@@ -259,6 +265,15 @@ TOOLS = [
                 },
                 "project": {"type": "string", "description": "项目名，可省略", "default": ""},
                 "note": {"type": "string", "description": "为什么改状态", "default": ""},
+                "force": {
+                    "type": "boolean",
+                    "description": (
+                        "跳过「跑通过」凭据核对（默认 false）。"
+                        "只在用例确实无法执行（环境故障）时用，且必须写 note 说明原因。"
+                        "正常流程不要用 —— 没跑过就标 debugged 等于骗 CI。"
+                    ),
+                    "default": False,
+                },
             },
             "required": ["case_id", "status"],
             "additionalProperties": False,
@@ -274,6 +289,10 @@ TOOLS = [
             "新建一条 Excel 用例，追加到 testcases/cases_excel/<项目>/<模块>/<模块>.xlsx。"
             "默认状态 draft（CI 不跑）。新建后必须 run_cases 跑通再 set_case_status 改成 debugged。"
             "写断言前先用 find_field_mapping 确认落库列名、用 explain_endpoint 看该断言什么。"
+            "**写操作（POST/PUT/PATCH/DELETE）正例会自动补「造数 → 查真实 id → 清理」"
+            "链路**：POST 补 teardowns，PUT/PATCH 补 setups+teardowns，DELETE 改成删"
+            "本用例造的种子；挂上后返回 data_chain 说明。反例不造数。"
+            "模型自己传了 setups/teardowns 就按传的落盘，不再重复规划。"
         ),
         params_schema={
             "type": "object",
@@ -282,13 +301,32 @@ TOOLS = [
                 "module": {"type": "string", "description": "模块名（也是目录名），如 admin_area"},
                 "path": {"type": "string", "description": "接口路径，以 / 开头，如 /admin/area"},
                 "method": {"type": "string", "description": "GET / POST / PUT / DELETE …"},
-                "title": {"type": "string", "description": "用例标题，如「修改地区（正常请求）」"},
+                "title": {
+                    "type": "string",
+                    "description": "用例标题/场景说明，如「（正常请求）」；不要重复写业务名（那是 api_name）",
+                },
                 "assertions": {
                     "type": "array",
                     "description": "断言列表（框架内部格式），不能为空",
                     "items": _ASSERTION_ITEMS,
                 },
-                "api_name": {"type": "string", "description": "接口中文名，如「修改地区」", "default": ""},
+                "api_name": {
+                    "type": "string",
+                    "description": (
+                        "接口的中文业务名，如「修改地区」。不要写「PUT /admin/area」这种"
+                        "方法+路径；传了也会按接口去现役用例里换成中文名"
+                    ),
+                    "default": "",
+                },
+                "case_name": {
+                    "type": "string",
+                    "description": (
+                        "可选的完整用例名称，如「地区管理 - 修改地区（正常请求）」"
+                        "（模块中文名 - 业务功能（场景））。不传或写成方法+路径时，"
+                        "按「模块中文名 - api_name（场景）」自动拼"
+                    ),
+                    "default": "",
+                },
                 "request_data": _JSON | {"description": "请求体 / 查询参数（GET 时放查询参数）"},
                 "request_headers": _JSON
                 | {"description": "请求头，如 {\"Authorization\": \"{{mall4j.token}}\"}；不传就用项目档案里的鉴权头"},
@@ -297,6 +335,15 @@ TOOLS = [
                 "marks": {"type": "string", "description": "标签，逗号分隔，如 admin_area,smoke", "default": ""},
                 "setups": _JSON | {"description": "前置步骤（造数据），格式同 YAML 用例的 setups"},
                 "teardowns": _JSON | {"description": "后置步骤（清数据）"},
+                "steps": _JSON
+                | {
+                    "description": (
+                        "多步场景链（创建→查询→修改→删除）。每一项："
+                        "{\"id\": \"step1\", \"method\": \"POST\", \"path\": \"/admin/area\", "
+                        "\"data\": {...}, \"assert\": [...]}。传了就以它为准，写进 Excel 的"
+                        "「步骤」列；path/method/assertions 只用于命名和第一步兜底"
+                    )
+                },
             },
             "required": ["project", "module", "path", "method", "title", "assertions"],
             "additionalProperties": False,

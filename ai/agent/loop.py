@@ -79,7 +79,9 @@ class Step:
         data = {
             "index": self.index,
             "tool": self.tool,
-            "arguments": self.arguments,
+            # 参数也要裁：模型可能塞一个超大的 request_data / assertions，
+            # 原样写进评测结果会把整份 json 撑到几十 MB
+            "arguments": _trim(self.arguments),
             "ok": self.ok,
             "error": self.error,
             "duration_ms": self.duration_ms,
@@ -100,6 +102,19 @@ def _trim(value: Any, limit: int = 400) -> Any:
     if isinstance(value, dict):
         return {str(k): _trim(v, limit) for k, v in value.items()}
     return value
+
+
+def _as_int(value: Any, default: int) -> int:
+    """把外部给的值转成 int。
+
+    这里**不用** ``_params.safe_int``：那套语义把 ``0`` 当"没给"
+    （分页参数 0 = 用默认值），但 ``max_steps=0`` / ``max_tool_calls=0``
+    是有意义的 —— 前者表示"只走一步"，后者表示"不限"。
+    """
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 @dataclass
@@ -127,6 +142,28 @@ class LoopResult:
         }
 
 
+def _tool_whitelist(allow_tools: Any) -> set[str] | None:
+    """把 ``allow_tools`` 归一成集合。
+
+    ``None`` = 不限制（全部工具）；**空集合 = 一个都不给**。
+    以前 ``allow_tools=[]`` 被当成"不限制"，等于白名单写错时反而全放开 ——
+    评测里这是最危险的失败方式，必须往收紧的方向解释。
+
+    字符串按逗号/空格拆（``"list_cases, get_case"``），免得一行拆成单个字符；
+    其他无法理解的结构也不放开，按"没有可用工具"处理并告警。
+    """
+    if allow_tools is None:
+        return None
+    if isinstance(allow_tools, str):
+        return {part for part in allow_tools.replace(",", " ").split() if part}
+    if isinstance(allow_tools, dict):
+        allow_tools = allow_tools.keys()
+    if isinstance(allow_tools, (list, tuple, set, frozenset)):
+        return {str(item) for item in allow_tools if item}
+    log.warning("allow_tools 结构无法识别（%s），按无可用工具处理", type(allow_tools).__name__)
+    return set()
+
+
 def _tool_definitions(registry: Any, allow_tools: list[str] | None) -> list[dict[str, Any]]:
     """把 ToolSpec 转成 OpenAI 兼容的工具定义。
 
@@ -134,10 +171,10 @@ def _tool_definitions(registry: Any, allow_tools: list[str] | None) -> list[dict
     否则模型可能用别的方式绕过去，测出来的是"它会不会用工具"，
     而不是"它会不会用对工具"。
     """
-    wanted = set(allow_tools or [])
+    wanted = _tool_whitelist(allow_tools)
     defs: list[dict[str, Any]] = []
     for spec in registry.list_tools():
-        if wanted and spec.name not in wanted:
+        if wanted is not None and spec.name not in wanted:
             continue
         defs.append(
             {
@@ -161,7 +198,9 @@ def _parse_arguments(raw: Any) -> dict[str, Any]:
         return {}
     try:
         parsed = json.loads(text)
-    except ValueError:
+    except (ValueError, RecursionError):
+        # 超深嵌套的 JSON 会触发 RecursionError，不是 ValueError；
+        # 模型偶尔会吐出这种参数，不该让整轮任务崩掉
         return {}
     return parsed if isinstance(parsed, dict) else {}
 
@@ -195,7 +234,7 @@ def run_task(
     Args:
         task: 自然语言任务，比如"看下 mall4j/admin_area 有几条用例"
         max_steps: 最多几轮（每轮 = 模型回一次话，可能带多个工具调用）
-        allow_tools: 只允许用这些工具（``None`` = 全部）
+        allow_tools: 只允许用这些工具（``None`` = 全部；空列表 = 一个都不给）
         max_tool_calls: 工具调用总数上限（``0`` = 不限制）。超了不再执行，
             **只把拒绝原因回灌** —— 见下面那段说明。
         registry: 工具注册表（测试注入用）
@@ -239,9 +278,10 @@ def run_task(
         {"role": "user", "content": task},
     ]
     tokens = {"prompt": 0, "completion": 0, "total": 0}
-    call_budget = max(0, int(max_tool_calls or 0))
+    call_budget = max(0, _as_int(max_tool_calls, 0))
+    step_limit = max(1, _as_int(max_steps, DEFAULT_MAX_STEPS))
 
-    for index in range(1, max(1, int(max_steps)) + 1):
+    for index in range(1, step_limit + 1):
         try:
             reply = client.chat_with_tools(messages, tools)
         except Exception as exc:  # noqa: BLE001 - 网络/模型错误都算这一条没跑完
@@ -250,13 +290,32 @@ def run_task(
             log.warning("评测循环第 %s 步模型调用失败: %s", index, exc)
             break
 
-        used = reply.get("usage") or {}
+        # 客户端是外部实现（测试注入 / 别的 LLM 网关），返回值结构不能假定。
+        # 顶层不是对象时**不能**当成"模型给了空回复"——那会被判成正常完成；
+        # 这是客户端 / 网关的问题，按环境错误结束这一条任务。
+        if not isinstance(reply, dict):
+            result.stopped = "llm_error"
+            result.error = f"模型客户端返回了 {type(reply).__name__}，不是对象"
+            log.warning("评测循环第 %s 步: %s", index, result.error)
+            break
+
+        used = reply.get("usage")
+        if not isinstance(used, dict):
+            used = {}
         for key, field_name in (("prompt", "prompt_tokens"), ("completion", "completion_tokens")):
-            tokens[key] += int(used.get(field_name) or 0)
+            tokens[key] += _as_int(used.get(field_name), 0)
         tokens["total"] = tokens["prompt"] + tokens["completion"]
 
-        message = reply.get("message") or {}
-        tool_calls = message.get("tool_calls") or []
+        message = reply.get("message")
+        if isinstance(message, str):
+            message = {"content": message}
+        elif not isinstance(message, dict):
+            message = {}
+        tool_calls = message.get("tool_calls")
+        if not isinstance(tool_calls, (list, tuple)):
+            tool_calls = []
+        else:
+            tool_calls = list(tool_calls)
 
         # 没有工具调用 = 模型认为任务完成了
         if not tool_calls:
@@ -273,11 +332,22 @@ def run_task(
             }
         )
 
-        for call in tool_calls:
-            function = call.get("function") or {}
+        for position, call in enumerate(tool_calls, start=1):
+            if not isinstance(call, dict):
+                log.warning("模型返回的 tool_call 不是对象（%s），跳过", type(call).__name__)
+                continue
+            function = call.get("function")
+            if not isinstance(function, dict):
+                function = {}
             name = str(function.get("name") or "")
+            if not name:
+                # 没有工具名的调用没法派发；记它只会污染 steps
+                log.warning("模型返回的 tool_call 没有工具名，跳过")
+                continue
             arguments = _parse_arguments(function.get("arguments"))
-            call_id = str(call.get("id") or f"call_{index}")
+            # 同一轮多个调用都没有 id 时不能都叫 call_<step>，否则历史里的
+            # tool_call_id 重复，下一轮请求会被 OpenAI 兼容接口拒掉
+            call_id = str(call.get("id") or f"call_{index}_{position}")
 
             # 超预算：不执行，只回灌拒绝原因。
             # 注意**也要记一步** —— 否则评测看不见"它想调但被拦了"，
@@ -319,8 +389,33 @@ def run_task(
                 continue
 
             call_started = time.perf_counter()
-            tool_result = registry.call(name, arguments)
+            try:
+                tool_result = registry.call(name, arguments)
+            except Exception as exc:  # noqa: BLE001 - run_task 的契约是"永不抛"
+                # 正常 registry 不会走到这里（call 自己兜住了），但评测可以
+                # 注入任意 registry；一条任务崩掉不该带走整批评测
+                log.error("工具 %s 调用抛出未捕获异常: %s", name, exc)
+                tool_result = {
+                    "ok": False,
+                    "tool": name,
+                    "error": {
+                        "type": type(exc).__name__,
+                        "message": str(exc),
+                        "hint": "工具执行异常，查看日志 logs/ 里的堆栈",
+                    },
+                }
             elapsed = round((time.perf_counter() - call_started) * 1000, 1)
+
+            if not isinstance(tool_result, dict):
+                # registry.call 正常永远返回 dict；注入的 registry 不保证
+                tool_result = {
+                    "ok": False,
+                    "tool": name,
+                    "error": {
+                        "type": "ToolResult",
+                        "message": f"工具返回了 {type(tool_result).__name__}，不是对象",
+                    },
+                }
 
             error = ""
             if not tool_result.get("ok"):

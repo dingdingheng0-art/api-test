@@ -64,6 +64,7 @@
 """
 from __future__ import annotations
 
+import heapq
 import json
 import os
 import threading
@@ -235,35 +236,44 @@ class DependencyGraph:
             if not project or not node.project or node.project == project
         }
 
-        # 入度 = 还有几个依赖没满足
+        # 入度 = 还有几个依赖没满足；同时建「被谁依赖」的反向表。
+        #
+        # 以前每弹出一个节点就遍历全部节点找"谁依赖我"，再对整个就绪
+        # 队列排序 —— O(n²)。用例多了（几百条）排序阶段会明显变慢。
+        # 现在用反向表和堆，整体 O(n log n)。
         indegree: dict[str, int] = {}
+        dependents: dict[str, list[str]] = {name: [] for name in scope}
         for name, node in scope.items():
             count = 0
             for dep in node.depends_on:
                 if dep in scope and dep != name:
                     count += 1
+                    dependents[dep].append(name)
             indegree[name] = count
 
-        # 就绪队列：入度为 0 的（没有依赖的）先跑
-        ready = sorted(
-            (name for name, deg in indegree.items() if deg == 0),
-            key=lambda n: scope[n].order,
-        )
+        # 就绪队列：入度为 0 的（没有依赖的）先跑。
+        # 堆里放 (order, 插入序号) —— 序号兜住 order 相同的情况，
+        # 保证排序结果和以前"稳定排序"一致。
+        position = {name: i for i, name in enumerate(scope)}
+        ready = [
+            (scope[name].order, position[name], name)
+            for name, deg in indegree.items()
+            if deg == 0
+        ]
+        heapq.heapify(ready)
         result: list[str] = []
 
         while ready:
-            name = ready.pop(0)
+            _order, _pos, name = heapq.heappop(ready)
             result.append(name)
 
             # 谁依赖我？我可以解锁了
-            for other, node in scope.items():
-                if name in node.depends_on:
-                    indegree[other] -= 1
-                    if indegree[other] == 0:
-                        ready.append(other)
-
-            # 保持顺序稳定
-            ready.sort(key=lambda n: scope[n].order)
+            for other in dependents[name]:
+                indegree[other] -= 1
+                if indegree[other] == 0:
+                    heapq.heappush(
+                        ready, (scope[other].order, position[other], other)
+                    )
 
         # 没排完的说明有环
         if len(result) != len(scope):

@@ -44,7 +44,7 @@
 | 3.2 | Token 硬编码 | **不属实**——用例写的是 `{{mall4j.token}}`，框架动态注入 | — |
 | 3.3 | 测试数据污染 | **属实但已缓解**——teardown 确实删了，但删除方式有隐患（见 P2-1） | P2 |
 | 3.4 | 缺少边界值覆盖 | **属实**——`shopId/seq/status` 全是固定值，无参数化 | P2 |
-| 4 | teardown 三个 Lambda 粉色 Unknown | **误读**——那是 pytest 的 fixture 收尾节点，与用例后置清理无关；后置实际全部 200 成功 | — |
+| 4 | teardown 三个 Lambda 粉色 Unknown | **已修复**——那是 pytest 给每个 fixture 自动挂的内部 finalizer（post-finalizer 通知 / 依赖簿记），不是用例后置。`framework/hooks.py` 的 `pytest_fixture_setup` 已在 allure 包装后还原内部 finalizer，报告里不再生成这些节点；同时隐藏 `pytestconfig` / `apienv` / `case_runner` 这类「setup 成功且无子步骤」的空节点（失败时仍保留） | ✅ |
 | 5 | timestamp 返回 null | **服务端行为**，与框架无关，建议找开发确认 | — |
 | 6 | 用例描述过于简单 | **属实**——框架漏了 `allure.dynamic.description()`，Excel 里写的描述根本没进报告 | **P0** |
 | — | **（新增）报告附件泄露真实 Token** | **属实**——5 个附件全部含完整 Authorization 明文 | **P0** |

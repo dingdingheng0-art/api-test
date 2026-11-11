@@ -14,6 +14,7 @@ import sys
 from pathlib import Path
 
 import pytest
+import yaml
 
 PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
@@ -27,6 +28,29 @@ from utils.config.project_profile import (
     ProjectRegistry,
     build_profile,
 )
+
+
+def _configured(project: str, env: str) -> dict:
+    """直接读 config.yaml 里某个项目/环境的原始配置。
+
+    这几条用例检查的是「档案字段来自配置」，所以期望值不能反过来问
+    ``ProjectRegistry`` 要（那是循环论证）。直接解析配置文件、独立展开
+    ``${环境变量}`` 占位符，被测代码怎么改都绕不过去。
+    """
+    from utils import paths
+    from utils.config.config_util import expand_env
+
+    raw = yaml.safe_load(paths.CONFIG_FILE.read_text(encoding="utf-8"))
+    return expand_env(raw)["projects"][project][env]
+
+
+def _raw(key: str) -> object:
+    """读 config.yaml 顶层字段（origin / referer 这类全局值）。"""
+    from utils import paths
+    from utils.config.config_util import expand_env
+
+    return expand_env(yaml.safe_load(paths.CONFIG_FILE.read_text(encoding="utf-8")))[key]
+
 
 # ---------------------------------------------------------------------------
 # 配置 → 档案
@@ -251,7 +275,7 @@ class TestProjectRegistry:
         """真配置里的 mall4j —— 确认字段读对了。"""
         profile = ProjectRegistry.get("mall4j", "online")
         assert profile is not None
-        assert profile.host == "http://103.236.97.137:8190/_admin"
+        assert profile.host == _configured("mall4j", "online")["host"]
         assert profile.login_type == LOGIN_TYPE_CUSTOM
         assert profile.token_header == "Authorization"
         assert profile.session_header is None
@@ -294,7 +318,7 @@ class TestProjectRegistry:
         profile = ProjectRegistry.get("mall4j", "pre")
         assert profile is not None
         assert profile.env == "pre"
-        assert profile.host == "http://103.236.97.137:8190/_admin"
+        assert profile.host == _configured("mall4j", "pre")["host"]
 
 
 # ---------------------------------------------------------------------------
@@ -446,8 +470,8 @@ class TestRequestHeaders:
         headers = build_default_headers(None, uuid="UUID-1", profile=profile)
 
         # 前端地址还是要有（Origin / Referer）
-        assert headers["Origin"] == "http://103.236.97.137:8190"
-        assert headers["Referer"] == "http://103.236.97.137:8190/"
+        assert headers["Origin"] == _raw("origin")
+        assert headers["Referer"] == _raw("referer")
         # 但会话标识那套不塞 —— token 本身就是全部凭证
         assert "uuid" not in headers
         assert "Authorization" not in headers

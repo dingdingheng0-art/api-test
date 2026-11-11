@@ -15,11 +15,25 @@ from typing import Any
 
 import pytest
 
+from framework.session_scope import targets_interface_tests
 from utils.logs.log_manager import log
+
+
+def _is_interface_session(config: pytest.Config) -> bool:
+    """跑单元测试时不要连数据库 / Redis / MQ。
+
+    **为什么**：根 conftest 无条件加载了本插件，``pytest unit_tests``
+    也会走到 ``pytest_configure`` —— 单测不需要真实连接，连了反而慢、
+    还可能因为环境没起 DB 而打一堆错误日志。
+    """
+    return targets_interface_tests(config)
 
 
 def pytest_configure(config: pytest.Config) -> None:
     """session 开始：准备校验层的连接。"""
+    if not _is_interface_session(config):
+        return
+
     from utils.config.config_manager import ConfigManager
 
     try:
@@ -49,6 +63,9 @@ def pytest_configure(config: pytest.Config) -> None:
 
 def pytest_unconfigure(config: pytest.Config) -> None:
     """session 结束：关掉所有连接。"""
+    if not _is_interface_session(config):
+        return
+
     from verify.manager import VerifyManager
 
     try:

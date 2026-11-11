@@ -42,7 +42,7 @@
 
 from __future__ import annotations
 
-from typing import Any, Callable, Iterable
+from typing import Any, Iterable
 
 from utils.logs.log_manager import log
 
@@ -70,6 +70,33 @@ class DataFactory:
         self.options = dict(options)
         # 本次造出来、等着被清的"钥匙"（主键 / 业务号）
         self._tracked: list[Any] = []
+        # 数据库客户端（按需创建，整个工厂实例复用）
+        self._db: Any = None
+
+    # ---------------- 数据库连接 ----------------
+
+    @property
+    def db(self):
+        """该工厂用的数据库客户端。
+
+        按需创建、**整个工厂实例复用同一个连接**。以前每次 ``create()``
+        都新建一个 ``DatabaseClient``，既不关闭也不复用：批量造 50 条数据
+        就开 50 个数据库连接，很容易把数据库的 ``max_connections`` 打满。
+        """
+        if self._db is None:
+            from verify.db import DatabaseClient
+
+            self._db = DatabaseClient(self.options.get("db_config"))
+        return self._db
+
+    def close(self) -> None:
+        """关掉工厂持有的连接（注册表清空 / session 结束时调用）。"""
+        if self._db is not None:
+            try:
+                self._db.close()
+            except Exception as exc:  # noqa: BLE001 - 关连接失败不该挡住清理
+                log.warning("关闭工厂 %s 的数据库连接失败: %s", self.full_name, exc)
+            self._db = None
 
     # ---------------- 子类实现 ----------------
 
@@ -82,13 +109,11 @@ class DataFactory:
 
         默认实现：按 ``cleanup_sql`` 逐条执行。
         """
-        from verify.db import DatabaseClient
-
         sql_list = self.cleanup_sql
         if not sql_list:
             return 0
 
-        db = DatabaseClient(self.options.get("db_config"))
+        db = self.db
         cleaned = 0
         for sql in sql_list:
             cleaned += db.cleanup(sql, tuple(keys) if keys else None)
@@ -168,6 +193,14 @@ class FactoryRegistry:
         return sorted(self._factories)
 
     def clear(self) -> None:
+        # 清注册表前先把工厂持有的数据库连接关掉，否则连接会一直挂着
+        for factory in self._factories.values():
+            close = getattr(factory, "close", None)
+            if callable(close):
+                try:
+                    close()
+                except Exception as exc:  # noqa: BLE001
+                    log.warning("关闭工厂 %s 失败: %s", factory.full_name, exc)
         self._factories.clear()
 
 

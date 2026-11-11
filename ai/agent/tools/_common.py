@@ -23,8 +23,30 @@ from utils.logs.log_manager import log
 # 文件缓存：{绝对路径: (mtime, 用例列表)}
 _CASE_CACHE: dict[str, tuple[float, list[dict[str, Any]]]] = {}
 
+# 读失败的文件：{绝对路径: (mtime, 异常)}。
+#
+# 普通列表场景读不了就跳过（一个坏文件不该让整个列表挂掉）；但**数条数**
+# 的场景跳不得 —— 跳过就是少数几条甚至数成 0，条数闸随之失效。
+# 所以把失败也缓存下来，``strict=True`` 的调用方可以直接抛出去。
+_FAILED_CACHE: dict[str, tuple[float, Exception]] = {}
+
 # 这些字段太长，列表里不返回，只在 get_case 详情里给
 HEAVY_KEYS = ("setups", "teardowns", "parameters", "extract")
+
+
+def _as_list(value: Any) -> list[Any]:
+    """把「应该是数组」的字段收敛成 list。
+
+    用例文件是给人手改的：``assert`` / ``setups`` 写成单个对象或标量时，
+    ``len()`` / 迭代会抛 ``TypeError``，把整条 get_case / 计数带崩。
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
 
 
 @dataclass
@@ -87,26 +109,41 @@ def _module_of(path: Path, project: str) -> str:
     return path.parent.name
 
 
-def _load_file(path: Path, project: str) -> list[dict[str, Any]]:
-    """读一个用例文件里的所有用例（带 mtime 缓存）。"""
+def _load_file(path: Path, project: str, strict: bool = False) -> list[dict[str, Any]]:
+    """读一个用例文件里的所有用例（带 mtime 缓存）。
+
+    Args:
+        strict: 读不了就抛异常，而不是返回空列表。**数条数的调用方必须开** ——
+            静默返回 ``[]`` 会让「这次会跑几条」被低估，条数闸就形同虚设。
+    """
     from testcases.case_loader import load_cases_from_file
 
     key = str(path.resolve())
     try:
         mtime = path.stat().st_mtime
     except OSError:
+        if strict:
+            raise
         return []
 
     cached = _CASE_CACHE.get(key)
     if cached and cached[0] == mtime:
+        failed = _FAILED_CACHE.get(key)
+        if strict and failed and failed[0] == mtime:
+            raise failed[1]
         return cached[1]
 
     try:
         cases = load_cases_from_file(path, project=project)
     except Exception as exc:  # noqa: BLE001 - 一个坏文件不该让整个列表挂掉
         log.warning("用例文件读不了 %s: %s", path, exc)
-        cases = []
+        _CASE_CACHE[key] = (mtime, [])
+        _FAILED_CACHE[key] = (mtime, exc)
+        if strict:
+            raise
+        return []
 
+    _FAILED_CACHE.pop(key, None)
     _CASE_CACHE[key] = (mtime, cases)
     return cases
 
@@ -123,7 +160,7 @@ def count_asserts(case: dict[str, Any]) -> int:
     total = 0
     for step in case.get("steps") or []:
         if isinstance(step, dict):
-            total += len(step.get("assert") or [])
+            total += len(_as_list(step.get("assert")))
     return total
 
 
@@ -199,6 +236,7 @@ def iter_cases(
     mark: str = "",
     keyword: str = "",
     status: str = "",
+    strict: bool = False,
 ) -> list[tuple[CaseRef, dict[str, Any]]]:
     """按条件筛出用例。
 
@@ -208,6 +246,8 @@ def iter_cases(
         mark: 标签，多个用逗号分隔（AND 语义：都要有）
         keyword: 关键字，匹配用例名 / 描述 / 路径
         status: 用例状态（draft / debugged / disabled / broken）
+        strict: 有文件读不了就抛异常（默认跳过）。数条数时必须开，
+            否则坏文件会被当成「0 条」，条数闸漏过去。
 
     Returns:
         ``[(CaseRef, 用例本体), ...]``
@@ -230,7 +270,7 @@ def iter_cases(
             continue
 
         rel = _rel(path)
-        loaded = _load_file(path, proj)
+        loaded = _load_file(path, proj, strict=strict)
         cases = [_case_of(data) for data in loaded]
         ids = assign_ids(rel, cases)
 
@@ -262,7 +302,7 @@ def iter_cases(
                 description=str(case.get("description") or ""),
                 status=case_status,
                 marks=marks,
-                steps=len(case.get("steps") or []),
+                steps=len(_as_list(case.get("steps"))),
                 asserts=count_asserts(case),
             )
             results.append((ref, case))
@@ -301,8 +341,8 @@ def case_detail(ref: CaseRef, case: dict[str, Any]) -> dict[str, Any]:
                 for step in (case.get("steps") or [])
                 if isinstance(step, dict)
             ],
-            "setup_count": len(case.get("setups") or []),
-            "teardown_count": len(case.get("teardowns") or []),
+            "setup_count": len(_as_list(case.get("setups"))),
+            "teardown_count": len(_as_list(case.get("teardowns"))),
             "has_parameters": bool(case.get("parameters")),
         }
     )
@@ -311,7 +351,7 @@ def case_detail(ref: CaseRef, case: dict[str, Any]) -> dict[str, Any]:
 
 def _step_summary(step: dict[str, Any]) -> dict[str, Any]:
     """一步的摘要：只给智能体看结构，不塞整段请求体。"""
-    asserts = step.get("assert") or []
+    asserts = _as_list(step.get("assert"))
     return {
         "id": step.get("id") or "",
         "description": step.get("description") or "",
@@ -324,6 +364,25 @@ def _step_summary(step: dict[str, Any]) -> dict[str, Any]:
     }
 
 
+def load_file_cases(path: Path, project: str = "") -> list[dict[str, Any]]:
+    """读一个用例文件里的所有用例（带缓存）。
+
+    写类工具（``case_io``）复验时也要读文件 —— 走这里，别自己再调一次
+    ``load_cases_from_file``。两个缓存各读各的，写完文件后一份失效、
+    另一份还是旧的，就会出现"刚写进去的用例复验说找不到"。
+    """
+    return _load_file(path, project)
+
+
 def clear_cache() -> None:
     """清掉用例缓存（改用例后调）。"""
     _CASE_CACHE.clear()
+    _FAILED_CACHE.clear()
+    # 底层加载器（testcases.case_loader）也有自己的 mtime 缓存 ——
+    # 一起清掉，否则"清完缓存在这次进程里还是读到旧的"。
+    try:
+        from testcases.case_loader import clear_load_cache
+
+        clear_load_cache()
+    except Exception as exc:  # noqa: BLE001 - 清缓存失败不该让工具挂掉
+        log.debug("清理用例文件缓存失败: %s", exc)

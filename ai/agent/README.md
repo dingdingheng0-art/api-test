@@ -53,14 +53,14 @@ ai/agent/tools/     工具契约 + 各工具的适配器   ← 你新增工具�
 ### 自检（不联网、不跑用例）
 
 ```bash
-python mcp_server/selfcheck.py        # 起真实子进程走一遍 MCP 协议
-python -m pytest unit_tests/test_agent_tools.py -q
+.venv/Scripts/python.exe -m ai.mcp_server.selfcheck      # 起真实子进程走一遍 MCP 协议
+.venv/Scripts/python.exe -m pytest unit_tests/test_agent_tools.py -q
 ```
 
 ### 手动调试协议
 
 ```bash
-echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | python -m mcp_server
+echo '{"jsonrpc":"2.0","id":1,"method":"tools/list","params":{}}' | python -m ai.mcp_server
 ```
 
 ## 加一个新工具
@@ -79,5 +79,5 @@ MCP 服务端、`tools/list` 会自动发现，不用改别处。
 - **返回值控制在上下文能承受的量**：列表类工具默认 limit 50，超过要显式 `truncated: true`。
 - **写类工具必须能撤销**：写前备份、写后校验、失败回滚，三道都不能省。
 - **`run_cases` 有三道边界闸**（条件 / 单次条数 / 会话累计）——
-  单看任何一道都挡不住"化整为零"，见 `docs/FRAMEWORK.md` 第二十一节。
+  单看任何一道都挡不住"化整为零"，见 `docs/FRAMEWORK.md` 第二十一节「评测集与成本审计」。
 - **审计是旁路**：写失败只告警，绝不能让记不了账导致不办事。

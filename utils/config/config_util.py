@@ -23,16 +23,11 @@ from __future__ import annotations
 
 import os
 import re
-from pathlib import Path
 from typing import Any
 
 import yaml
 
-# 项目根：本文件在 <root>/utils/config_util.py，向上一级就是 root
-from utils.logs.log_manager import log
 from utils.paths import CONFIG_FILE
-
-_cached: dict[str, Any] | None = None
 
 # ${VAR} 或 ${VAR:默认值}
 _ENV_PATTERN = re.compile(r"\$\{([A-Za-z_][A-Za-z0-9_]*)(?::([^}]*))?\}")
@@ -98,34 +93,25 @@ def load_raw_config(force: bool = False) -> dict[str, Any]:
 def load_config(force: bool = False) -> dict[str, Any]:
     """加载 configs/config.yaml 为 dict（进程内缓存；force=True 强制重读）。
 
+    这里**只做转发**，真正的加载和缓存都在 ``ConfigManager`` 里 ——
+    以前两个类各存一份缓存，``force=True`` 只刷新其中一个，
+    于是同一个进程里会出现"两套配置"（改了 .env 重启后仍读到旧值）。
+    对外保留原来的契约：文件不存在时抛 ``FileNotFoundError``
+    （``ConfigManager`` 那边是记日志返回空字典，工具脚本需要明确报错）。
+
     加载顺序：
 
     1. 先把 ``.env`` 文件里的值灌进环境变量（不覆盖已有的环境变量）
     2. 再读 config.yaml，把 ``${环境变量}`` 展开
     """
-    global _cached
-    if _cached is not None and not force:
-        return _cached
-
     if not CONFIG_FILE.exists():
         raise FileNotFoundError(f"配置文件不存在: {CONFIG_FILE}")
 
-    with CONFIG_FILE.open("r", encoding="utf-8") as f:
-        data = yaml.safe_load(f) or {}
+    # 函数内导入：config_manager 依赖本模块的 expand_env，
+    # 模块级导入会形成循环。
+    from utils.config.config_manager import ConfigManager
 
-    if not isinstance(data, dict):
-        raise ValueError(f"config.yaml 顶层必须是 mapping: {CONFIG_FILE}")
-
-    # .env 文件 → 环境变量（环境变量本身优先，不被覆盖）
-    try:
-        from utils.config.secrets import apply_env_file
-
-        apply_env_file()
-    except Exception as exc:  # noqa: BLE001 - .env 读不了不该影响主流程
-        log.warning("加载 .env 失败（已忽略）: %s", exc)
-
-    _cached = expand_env(data)
-    return _cached
+    return ConfigManager.load_config(force=force)
 
 
 def get_config() -> dict[str, Any]:

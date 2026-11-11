@@ -76,15 +76,28 @@ PROMPTS: dict[str, dict[str, Any]] = {
 - `assertions` 用框架内部格式：{"type": "equal", "field": "code", "expected": "00000"}。
   字段路径**不带** `$.` 前缀。工具会自动转成 Excel 单元格里的扁平格式。
 - 比较类断言必须写 `expected`；落库断言用 {"type": "db_query", "query": ..., "alias": ..., "params": [...], "expected": ...}。
+  **落库断言只放主步骤的 `assertions`，不要放到 `teardowns` 的验证步骤上** ——
+  后置只做清理（DELETE 清理步骤上的「删后查不到」除外）。
 - 新建的用例是 draft（CI 不跑），必须跑通再改状态。
 
 **用例要求**
 - 每条步骤必须有 assert，至少断言 `success` 和业务字段；只断言 status_code 不算。
-- 写操作用例要有 setups（造数）和 teardowns（清理），teardown 只能删本用例自己造的数据。
-- 用例名用中文短语，一眼能看懂测什么。
+- 写操作用例的 setups（造数）和 teardowns（清理）**由 create_case 自动补**：
+  POST 补 teardowns，PUT/PATCH 补 setups+teardowns，DELETE 改成删本用例造的种子。
+  返回里 `data_chain` 非空就是挂上了；为空说明规划不出安全链路，需要在返回的
+  `quality_warnings` 里看原因（通常要标 `needs_manual_setup`）。
+  自己传了 setups/teardowns 就以你传的为准，工具不重复规划；teardown 仍然只能删
+  本用例自己造的数据（引用 `{{步骤.id}}` 或 `{{tools.find_id_by_fixed(...)}}`）。
+- 命名照现役约定：`api_name` 写中文业务动作（如「修改地区」），`title` 只写场景
+  （如「（正常请求）」），完整用例名称是「模块中文名 - 业务动作（场景）」。
+  **不要写「PUT /admin/area」这种方法和路径** —— 工具虽然会兜底换成中文名，
+  但换不出来时只能保留原样。
 - 加上 `marks`，写操作用例打上模块标签。
 
-**流程**：create_case → run_cases(case_file=...) → 通过后 set_case_status(case_id, "debugged")。
+**流程**：create_case → run_cases(case_file=..., run_draft=true) → 通过后 set_case_status(case_id, "debugged")。
+（新用例默认是 draft，`run_cases` 不带 `run_draft=true` 一条都不会执行，`total=0` 不是通过。
+转 debugged 会核对「跑通过」凭据 —— 整体通过后 `run_cases` 自动记账；没记录、或记录之后又改过用例，都会被拒。
+确实跑不了（环境故障）才用 `force=true`，并写明 note。）
 没跑通就如实说没跑通，不要标 debugged。最后附一行「覆盖了哪些断言维度」。""",
     },
     "heal_failure": {
@@ -103,7 +116,7 @@ PROMPTS: dict[str, dict[str, Any]] = {
 
 **按 plan_heal 的 action 分派（不要自己另判）**：
 
-- `rerun`（环境问题）→ run_cases(case_id=...) 重跑确认。**不要动任何文件**。
+- `rerun`（环境问题）→ run_cases(case_id=..., run_draft=true) 重跑确认（draft 用例不加 run_draft 不会执行）。**不要动任何文件**。
 - `file_defect`（服务问题）→ **停止**。整理证据（请求/响应/期望 vs 实际）说明这是缺陷。
   确实短期修不了，set_case_status(status="broken", note="...") 标记 —— 用例内容保持原样。
   **绝对不允许**改断言或改期望值让它变绿。

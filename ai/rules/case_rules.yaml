@@ -1,0 +1,276 @@
+# 接口测试设计规则的机器可读版。
+#
+# 唯一的规范来源是 .claude/skills/apitest-design/SKILL.md。
+# 改规则顺序：先改 SKILL.md → 再改本文件 → 最后改代码。
+# 三处不一致视为 bug（unit_tests/test_case_rules.py 会校验）。
+version: 1
+source: .claude/skills/apitest-design/SKILL.md
+
+evidence_levels:
+  metadata: 接口元数据（required/type/enum/bounds/format）
+  knowledge: 知识图谱字段映射，confidence >= 0.9
+  existing_case: 现役已通过用例
+  project_config: 项目登录/成功码/失败语义
+  assumption: 无依据假设，必须标 needs_manual_setup
+
+dimensions:
+  # ---------- A 参数契约 ----------
+  - id: A1
+    name: required_missing
+    label: 必填缺失
+    applies_to: [all]
+    trigger: required_field_exists
+    expected: rejected
+    priority: P1
+    evidence: metadata
+  - id: A2
+    name: type_invalid
+    label: 类型错误
+    applies_to: [all]
+    trigger: field_type_known
+    expected: rejected
+    priority: P1
+    evidence: metadata
+  - id: A3
+    name: enum_invalid
+    label: 枚举非法
+    applies_to: [all]
+    trigger: field_enum_defined
+    expected: rejected
+    priority: P1
+    evidence: metadata
+  - id: A4
+    name: length_boundary
+    label: 长度边界
+    applies_to: [all]
+    trigger: length_bound_known
+    expected: boundary
+    priority: P2
+    evidence: metadata
+  - id: A5
+    name: format_invalid
+    label: 格式非法
+    applies_to: [all]
+    trigger: field_format_known
+    expected: rejected
+    priority: P2
+    evidence: metadata
+  - id: A6
+    name: empty_value
+    label: 空值/null
+    applies_to: [all]
+    trigger: required_string_or_array
+    expected: rejected
+    priority: P2
+    evidence: metadata
+  - id: A7
+    name: extra_field
+    label: 多余字段
+    applies_to: [all]
+    trigger: body_endpoint
+    expected: per_contract
+    priority: P3
+    evidence: metadata
+
+  # ---------- B 业务语义 ----------
+  - id: B1
+    name: pagination_boundary
+    label: 分页边界
+    applies_to: [query]
+    trigger: page_param_exists
+    expected: boundary
+    priority: P1
+    evidence: metadata
+  - id: B2
+    name: sort_filter
+    label: 排序/过滤
+    applies_to: [query]
+    trigger: sort_or_filter_param_exists
+    expected: subset_or_order
+    priority: P2
+    evidence: existing_case
+  - id: B3
+    name: idempotency
+    label: 幂等/重复提交
+    applies_to: [write]
+    trigger: unique_key_or_create_endpoint
+    expected: consistent_or_conflict
+    priority: P2
+    evidence: knowledge
+  - id: B4
+    name: state_transition
+    label: 状态迁移
+    applies_to: [write]
+    trigger: status_field_exists
+    expected: legal_ok_illegal_rejected
+    priority: P2
+    evidence: knowledge
+
+  # ---------- C 权限 ----------
+  - id: C1
+    name: unauthenticated
+    label: 未登录
+    applies_to: [authenticated]
+    trigger: endpoint_requires_login
+    expected: unauthorized
+    priority: P0
+    evidence: project_config
+  - id: C2
+    name: forbidden_role
+    label: 无权限角色
+    applies_to: [authenticated]
+    trigger: role_model_exists
+    expected: forbidden
+    priority: P1
+    evidence: project_config
+  - id: C3
+    name: token_invalid
+    label: token 失效/伪造
+    applies_to: [authenticated]
+    trigger: endpoint_requires_login
+    expected: unauthorized
+    priority: P2
+    evidence: project_config
+
+  # ---------- D 数据一致性 ----------
+  - id: D1
+    name: response_vs_db
+    label: 响应字段 vs 库
+    applies_to: [read, write]
+    trigger: field_mapping_confidence_ge_0_9
+    expected: value_equal
+    priority: P1
+    evidence: knowledge
+  - id: D2
+    name: write_then_exists
+    label: 写后能查到
+    applies_to: [write]
+    trigger: field_mapping_confidence_ge_0_9
+    expected: db_exists
+    priority: P1
+    evidence: knowledge
+  - id: D3
+    name: delete_then_missing
+    label: 删后查不到
+    applies_to: [delete]
+    trigger: field_mapping_confidence_ge_0_9
+    expected: db_not_exists
+    priority: P1
+    evidence: knowledge
+  - id: D4
+    name: cross_table_consistency
+    label: 跨表一致
+    applies_to: [write]
+    trigger: related_tables_known
+    expected: values_equal
+    priority: P2
+    evidence: knowledge
+
+  # ---------- E 接口关联 ----------
+  - id: E1
+    name: crud_scenario
+    label: 创建→查询→修改→删除
+    applies_to: [resource]
+    trigger: complete_crud_exists
+    expected: chain_consistent
+    priority: P1
+    evidence: knowledge
+  - id: E2
+    name: fk_dependency
+    label: FK 依赖
+    applies_to: [write]
+    trigger: foreign_key_field_known
+    expected: parent_created_first
+    priority: P1
+    evidence: knowledge
+  - id: E3
+    name: cleanup_isolation
+    label: 清理隔离
+    applies_to: [write]
+    trigger: write_endpoint
+    expected: only_own_data_deleted
+    priority: P0
+    evidence: metadata
+
+  # ---------- F 异常健壮性 ----------
+  - id: F1
+    name: nonexistent_id
+    label: 不存在的 id
+    applies_to: [id_param]
+    trigger: id_parameter_exists
+    expected: business_failure_or_empty
+    priority: P2
+    evidence: metadata
+  - id: F2
+    name: deleted_id
+    label: 已删除的 id
+    applies_to: [id_param]
+    trigger: resource_deletable
+    expected: business_failure_or_empty
+    priority: P3
+    evidence: knowledge
+  - id: F3
+    name: invalid_path_param
+    label: 非法 path 参数
+    applies_to: [path_param]
+    trigger: path_param_type_known
+    expected: rejected_not_500
+    priority: P2
+    evidence: metadata
+  - id: F4
+    name: oversized_or_special_input
+    label: 超大 body / 特殊字符
+    applies_to: [text_field]
+    trigger: text_field_exists
+    expected: rejected_or_safe
+    priority: P3
+    evidence: metadata
+
+# 最小交付标准：按接口类型算应测维度
+min_delivery:
+  read:
+    required: ["positive", "A?", "D1?"]
+    note: A 类在元数据允许时至少 2 个；D1 仅在映射置信度 >= 0.9 时
+  paginated_read:
+    extends: read
+    required: [B1]
+  write:
+    required: ["positive", "A?", "D2?", "E2?", "E3"]
+  delete:
+    required: ["positive", "D3?", "F1?", "E3"]
+  authenticated:
+    required: [C1]
+  role_based:
+    required: [C2]
+  resource_with_crud:
+    required: [E1]
+
+# 质量闸门：写入口（create_case / apply_case_change / set_case_status）共用的硬约束。
+# 阈值必须和 .claude/skills/apitest-design/SKILL.md 的验收口径一致。
+quality_gates:
+  # 正例至少要有几个业务断言（status_code / code / success 不算）。
+  # 多步用例按整条链合计算。
+  min_business_asserts: 2
+  # 转 debugged 时，正例至少要有几个**值断言**（带 expected 的比较 / db_query）。
+  # 落盘阶段这里是 0；set_case_status(debugged) 会临时要求 1。
+  # exists / is_not_none 只证明字段存在，不算值断言。
+  min_value_asserts: 0
+  # 多步用例的断言必须落在验证步（最后一个读步骤）上
+  multi_step_assert_on_verification: true
+  # 反例必须断言「被拒绝」，只发请求（或零断言）不算验证
+  require_negative_rejection: true
+  # 正例写操作必须有 teardowns，或写步骤 DELETE 自清理（多步链逐个查）
+  require_write_cleanup: true
+  # 用例名 / 接口名不能是「方法 + 路径」
+  reject_method_path_naming: true
+
+# 反模式：生成后出现即打回
+anti_patterns:
+  - positive_only
+  - baseless_negative
+  - status_code_only
+  - pass_rate_as_coverage
+  - single_step_as_scenario
+  - write_without_cleanup
+  - low_confidence_db_assert
+  - unresolved_path_param

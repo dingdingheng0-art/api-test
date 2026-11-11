@@ -26,9 +26,9 @@ import os
 import subprocess
 import sys
 import time
-from pathlib import Path
 from typing import Any
 
+from ai.agent.tools._params import safe_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok, truncate_text
 from utils import paths
 from utils.logs.log_manager import log
@@ -60,8 +60,18 @@ def run_cases(
     env: str = "",
     timeout: int = DEFAULT_TIMEOUT,
     report: str = "none",
+    run_draft: bool = False,
 ) -> dict[str, Any]:
-    """跑用例，返回结构化结果摘要。"""
+    """跑用例，返回结构化结果摘要。
+
+    Args:
+        run_draft: 连 draft / disabled / broken 也一起跑。
+
+            **必须开着**的场景：智能体刚生成的用例一律是 ``draft``
+            （``create_case`` 的默认状态），默认过滤下一条都不会执行，
+            ``result.total`` 会是 0 —— 看起来像"跑过了"，实际上什么都没测。
+            自愈验证（``verify_heal``）必须走这条路径。
+    """
     if not any([project, module, mark, keyword, case_file, case_id]):
         raise ToolError(
             "必须至少指定一个筛选条件（project / module / mark / keyword / case_file / case_id）",
@@ -115,10 +125,21 @@ def run_cases(
     if case_file:
         cmd += ["--case-file", case_file]
     if case_id:
-        # 多个编号用逗号分隔 —— 自愈验证时「改完只重跑这一条」靠它
-        cmd += ["--case-id", str(case_id)]
+        # 多个编号用逗号分隔 —— 自愈验证时「改完只重跑这一条」靠它。
+        #
+        # ``--case-id`` 是 ``action="append"``：一次只能带一个编号，
+        # 逗号串整体传过去一条都匹配不上（收集阶段直接 0 条）。
+        # 这里按逗号拆开，逐个拼成一个 ``--case-id``。
+        for one in str(case_id).split(","):
+            one = one.strip()
+            if one:
+                cmd += ["--case-id", one]
     if env:
         cmd += ["--env", env]
+    if run_draft:
+        # 不加这个，draft 用例在收集阶段就被状态过滤掉了：
+        # pytest 退出码 0、total=0，调用方很容易把"一条没跑"当成"全部通过"。
+        cmd += ["--run-draft"]
 
     log.info("工具 run_cases 执行: %s", " ".join(cmd))
 
@@ -135,6 +156,10 @@ def run_cases(
     result_path = paths.REPORTS_ROOT / "result.json"
     before_mtime = result_path.stat().st_mtime if result_path.exists() else None
 
+    # timeout 由客户端传，schema 层不校验类型；坏值退回默认值，
+    # 不能让 int("abc") 的 ValueError 变成一次"跑用例失败"。
+    timeout = max(30, safe_int(timeout, DEFAULT_TIMEOUT))
+
     started_wall = time.time()
     started = time.perf_counter()
     try:
@@ -145,7 +170,7 @@ def run_cases(
             text=True,
             encoding="utf-8",
             errors="replace",
-            timeout=max(30, int(timeout)),
+            timeout=timeout,
             env=env_vars,
         )
     except subprocess.TimeoutExpired:
@@ -168,6 +193,13 @@ def run_cases(
     # 自相矛盾的数据比没有数据更糟，模型会照着旧失败编结论。
     failures = _read_failures(since=started_wall) if fresh else []
 
+    # report=none / html 时 pytest 根本不写 allure 结果，上面一定是空列表。
+    # 这时改读 junit.xml —— run.py 每次都会产出它，里面有每条失败的名字和
+    # 错误信息。否则智能体只能看到 "failed=3" 却一条明细都拿不到，
+    # 接着就会去 diagnose_failures 翻到上一轮的旧失败。
+    if fresh and not failures:
+        failures = _read_junit_failures(since=started_wall)
+
     payload = ok(
         exit_code=proc.returncode,
         elapsed_seconds=elapsed,
@@ -183,6 +215,48 @@ def run_cases(
             "（用例格式错 / 导入失败 / 参数不对）。看 console_tail 找具体报错。"
             "不要把上一次的结果当成本次结论。"
         )
+    elif safe_int(result.get("total"), 0) == 0:
+        payload["hint"] = (
+            "本次没有执行任何用例（total=0）—— 这不是「通过」。"
+            "检查筛选条件或用例编号是否写错；"
+            "如果目标用例还是 draft（刚生成的默认状态），"
+            "加 run_draft=true 再跑一次。"
+        )
+
+    # 真正整体通过之后才记「跑通过」凭据 —— set_case_status 转 debugged 要核对它。
+    # 有失败/跳过就不记：说不清是哪几条过了，宁可让调用方再跑一次。
+    # result.json 是运行态文件，计数被写坏时不能把「跑完读结果」这一整段弄挂
+    total_count = safe_int(result.get("total"), 0)
+    failed_count = safe_int(result.get("failed"), 0)
+    error_count = safe_int(result.get("error"), 0)
+    skipped_count = safe_int(result.get("skipped"), 0)
+    if (
+        fresh
+        and proc.returncode == 0
+        and total_count > 0
+        and not failed_count
+        and not error_count
+        and not skipped_count
+    ):
+        recorded = _record_verified(
+            total_count,
+            run_draft=run_draft,
+            project=project,
+            module=module,
+            mark=mark,
+            keyword=keyword,
+            case_file=case_file,
+            case_id=case_id,
+        )
+        payload["verified_recorded"] = recorded
+        if not recorded:
+            # 不解释一句的话，随后 set_case_status(debugged) 会被拒，
+            # 而拒绝理由是「账本里没有它的通过记录」—— 明明刚跑过。
+            payload["verify_hint"] = (
+                "这次跑通了，但没能记下「跑通过」凭据（候选条数和实际执行条数对不上，"
+                "或账本写不进去）。随后 set_case_status(debugged) 会被拒 —— "
+                "用 case_id 精确指定要转正的那几条再跑一次即可。"
+            )
 
     return payload
 
@@ -198,26 +272,136 @@ def _count_matching(
     """算出这组筛选条件会跑多少条用例（跑之前先算，不要先跑了再说）。
 
     条件之间是 **AND**：和 ``run.py`` 的筛选语义一致。
-    算不出来（用例目录读不了）时返回 0 —— 宁可放过，也不要因为
-    统计失败把正常调用挡掉。
+
+    ⚠️ 统计失败时**不能返回 0**。返回 0 等于单次闸和会话闸同时消失：
+    只要用例目录里有一个读不了的文件，``matched > 50`` 和
+    ``run_budget.check(0)`` 都会放过，模型就能以「统计不了」为由跑全量。
+    所以这里 fail-closed —— ``case_id`` 还能按编号直接数（不依赖读取），
+    其余筛选直接报错，让调用方精确指定要跑哪几条。
+    """
+    wanted = {c.strip() for c in str(case_id).split(",") if c.strip()}
+    try:
+        return len(
+            _matching_cases(
+                project=project,
+                module=module,
+                mark=mark,
+                keyword=keyword,
+                case_file=case_file,
+                case_id=case_id,
+            )
+        )
+    except Exception as exc:  # noqa: BLE001 - 但要 fail-closed，不能静默放行
+        log.warning("统计用例条数失败: %s", exc)
+        if wanted:
+            # 编号是调用方自己给的，数得出来 —— 按上限记账，闸仍然有效
+            return len(wanted)
+        raise ToolError(
+            f"无法统计这次筛选会跑多少条用例，边界校验不生效：{exc}",
+            hint=(
+                "改用 case_id 只跑要验证的那几条（如 case_id='API-168'），"
+                "或者先调 list_cases 确认用例目录能不能正常读取。"
+            ),
+        ) from exc
+
+
+def _matching_cases(
+    project: str,
+    module: str,
+    mark: str,
+    keyword: str,
+    case_file: str,
+    case_id: str,
+) -> list[tuple[Any, dict[str, Any]]]:
+    """这组筛选条件会跑到哪些用例（**不含状态过滤**）。
+
+    统计条数和记录「跑通过」凭据共用这一份筛选逻辑 —— 各写一套迟早对不上，
+    记账时就会把没跑的用例记成通过。
+
+    Returns:
+        ``[(CaseRef, 用例本体), ...]``，和 ``iter_cases`` 的返回一致。
     """
     from ai.agent.tools._common import iter_cases
 
-    try:
-        if case_id:
-            wanted = {c.strip() for c in str(case_id).split(",") if c.strip()}
-            return sum(1 for ref, _ in iter_cases() if ref.case_id in wanted)
+    wanted = {c.strip() for c in str(case_id).split(",") if c.strip()}
+    pairs = iter_cases(
+        project=project, module=module, mark=mark, keyword=keyword, strict=True
+    )
+    if case_id:
+        pairs = [(ref, case) for ref, case in pairs if ref.case_id in wanted]
+    if case_file:
+        target = str(case_file).replace("\\", "/").strip()
+        pairs = [
+            (ref, case)
+            for ref, case in pairs
+            if ref.file == target or ref.file.endswith("/" + target)
+        ]
+    return pairs
 
-        pairs = iter_cases(
-            project=project, module=module, mark=mark, keyword=keyword
-        )
-        if case_file:
-            target = str(case_file).replace("\\", "/").strip()
-            pairs = [p for p in pairs if p[0].file == target or p[0].file.endswith("/" + target)]
-        return len(pairs)
-    except Exception as exc:  # noqa: BLE001 - 统计失败不该挡住正常执行
-        log.warning("统计用例条数失败（跳过条数闸）: %s", exc)
+
+def _record_verified(matched: int, run_draft: bool, **filters: Any) -> int:
+    """把这次跑通过的用例记进账本，供 ``set_case_status`` 核对。
+
+    Args:
+        matched: 实际执行并通过的条数（``result.total``）
+        run_draft: 本次是否连 draft / disabled / broken 一起跑了
+
+    Returns:
+        写入条数。任何异常都吞掉 —— 记账失败不该把一次成功执行变成报错，
+        只是这次转正会因为没有凭据而被拒（调用方再跑一次即可）。
+    """
+    from ai.agent.tools.verify_ledger import record
+    from utils.cases.case_status import RUNNABLE_STATUSES, resolve_status
+
+    try:
+        cases = _matching_cases(**filters)
+        # 按 pytest 的收集语义过滤，否则「候选条数」永远对不上「实际执行条数」：
+        #
+        # - 给了 case_id：pytest 按编号挑，**不看状态**（见 pytest_plugin 的
+        #   only_case_ids 分支）—— 自愈验证改完的 draft 用例正靠这条路径
+        # - run_draft=True：全跑，不过滤
+        # - 其余情况：只跑 debugged
+        if not filters.get("case_id") and not run_draft:
+            cases = [
+                (ref, case)
+                for ref, case in cases
+                if resolve_status(case) in RUNNABLE_STATUSES
+            ]
+
+        expected = _expanded_count(cases)
+        if expected != matched:
+            # 筛选语义和执行结果对不上，说不清哪几条真跑了 —— 宁可不记
+            log.warning(
+                "候选 %d 条（参数化展开后）、实际通过 %d 条，跳过记录跑通过凭据",
+                expected,
+                matched,
+            )
+            return 0
+        return record(cases)
+    except Exception as exc:  # noqa: BLE001
+        log.warning("记录跑通过凭据失败（不影响本次结果）: %s", exc)
         return 0
+
+
+def _expanded_count(cases: list[tuple[Any, dict[str, Any]]]) -> int:
+    """这些用例在 pytest 里会被展开成几条。
+
+    带「参数化数据」的用例一条会变成好几条（每个参数组一条），
+    ``result.total`` 数的是展开后的条数。不展开就对不上，正常模块永远记不上账。
+
+    展开失败时按 1 条算：真展开失败的话这次执行本身就会挂，
+    根本走不到记账这一步。
+    """
+    from utils.cases.param_expander import expand_case
+
+    total = 0
+    for _ref, case in cases:
+        try:
+            total += len(expand_case(case))
+        except Exception as exc:  # noqa: BLE001 - 展开不了按一条算
+            log.debug("参数化展开失败，按 1 条计: %s", exc)
+            total += 1
+    return total
 
 
 def _tail(text: str, lines: int) -> str:
@@ -231,10 +415,13 @@ def _read_result_json() -> dict[str, Any]:
     if not path.exists():
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         log.warning("result.json 读不了: %s", exc)
         return {}
+    # 合法 JSON 不等于合法结果：被写成 ``[]`` / ``124`` 时下面到处 ``.get``，
+    # 一抛 TypeError 整个 run_cases 就挂了 —— 宁可当成「没有结果」。
+    return data if isinstance(data, dict) else {}
 
 
 def _read_failures(since: float | None = None) -> list[dict[str, Any]]:
@@ -298,10 +485,65 @@ def _fresh_result_names(results_dir: Any, since: float) -> set[str]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            continue
         name = data.get("name")
         if name:
             names.add(str(name))
     return names
+
+
+def _read_junit_failures(since: float | None = None) -> list[dict[str, Any]]:
+    """从 ``reports/junit.xml`` 提取失败用例（report=none 时的兜底）。
+
+    Args:
+        since: 只认这个时刻之后写的 junit.xml（防止读到上一轮的）。
+
+    Returns:
+        ``[{"case": 用例名, "error_type": ..., "message": ...}, ...]``
+    """
+    import xml.etree.ElementTree as ET
+
+    path = paths.REPORTS_ROOT / "junit.xml"
+    if not path.exists():
+        return []
+
+    if since is not None:
+        try:
+            if path.stat().st_mtime < since:
+                return []
+        except OSError:
+            return []
+
+    try:
+        root = ET.parse(path).getroot()
+    except (ET.ParseError, OSError) as exc:
+        log.warning("junit.xml 解析失败: %s", exc)
+        return []
+
+    failures: list[dict[str, Any]] = []
+    for case in root.iter("testcase"):
+        problem = case.find("failure")
+        if problem is None:
+            problem = case.find("error")
+        if problem is None:
+            continue
+
+        name = case.get("name") or ""
+        # pytest 的 junit 里用例名形如 "test_api_case[用例名-...#ID]"
+        if name.startswith("test_api_case[") and name.endswith("]"):
+            name = name[len("test_api_case["):-1]
+        error_type = problem.get("type") or problem.tag
+        message = problem.get("message") or (problem.text or "").strip()
+        failures.append(
+            {
+                "case": name,
+                "error_type": error_type,
+                "message": truncate_text(message, 300),
+            }
+        )
+
+    return failures[:50]
 
 
 def get_last_result() -> dict[str, Any]:
@@ -314,12 +556,18 @@ def get_last_result() -> dict[str, Any]:
         )
 
     junit = paths.REPORTS_ROOT / "junit.xml"
+    # 结果文件可能在两次读之间被清掉（并发跑 / 报告清理插件）——
+    # ``stat()`` 抛 FileNotFoundError 会让「看一眼上次结果」这种只读操作报错。
+    try:
+        age = round(time.time() - (paths.REPORTS_ROOT / "result.json").stat().st_mtime)
+    except OSError:
+        age = None
     return ok(
         result=result,
         failures=_read_failures(),
         allure_dir=str(paths.ALLURE_RESULTS) if paths.ALLURE_RESULTS.exists() else "",
         junit_exists=junit.exists(),
-        result_file_age_seconds=round(time.time() - (paths.REPORTS_ROOT / "result.json").stat().st_mtime),
+        result_file_age_seconds=age,
     )
 
 
@@ -379,6 +627,15 @@ TOOLS = [
                     "type": "string",
                     "description": "报告类型：none（默认，最快）/ html / allure",
                     "default": "none",
+                },
+                "run_draft": {
+                    "type": "boolean",
+                    "description": (
+                        "连 draft / disabled / broken 也一起跑（默认 false）。"
+                        "验证**刚生成**或**改完还没转正**的用例时必须开 —— "
+                        "否则一条都不会执行，total=0 不代表通过"
+                    ),
+                    "default": False,
                 },
             },
             "additionalProperties": False,

@@ -41,14 +41,21 @@ from typing import Any
 
 import pytest
 
+from framework.session_scope import targets_interface_tests
 from utils.logs.log_manager import log
 
 #: 关掉重试的环境变量（文档里一直写着，但以前**根本没实现**）
 NO_RETRY_ENV = "APITEST_NO_RETRY"
 
 # 本次运行的配置（pytest_configure 里填）
+#
+# **默认关闭**：``pytest_runtest_call`` 是全局包装器，根 conftest 又会
+# 把本插件带进 ``pytest unit_tests``。默认开着的话，单测里任何一次
+# 网络异常 / 上一条用例留下的 5xx 都会触发"环境抖动"重试，
+# 睡几秒再跑一遍 —— 单元测试必须是确定性的，不能重试。
+# 只有确认是接口 session（``pytest_configure``）才会打开。
 _RETRY_CONFIG: dict[str, Any] = {
-    "enabled": True,
+    "enabled": False,
     "max_attempts": 3,
     "wait_seconds": 2.0,
     "backoff": 1.5,
@@ -75,6 +82,10 @@ def pytest_addoption(parser: pytest.Parser) -> None:
 def pytest_configure(config: pytest.Config) -> None:
     """读配置，确定重试策略。"""
     global _RETRY_CONFIG
+
+    if not targets_interface_tests(config):
+        _RETRY_CONFIG = {**_RETRY_CONFIG, "enabled": False}
+        return
 
     # 两个开关都认：命令行 ``--no-retry`` 和环境变量 ``APITEST_NO_RETRY=1``
     #
@@ -143,6 +154,15 @@ def pytest_runtest_call(item: pytest.Item) -> None:
         except BaseException as exc:
             ...                     # 失败了，判断要不要重试
     """
+    # 快照当前 allure 结果里已有的步骤/附件/标签。
+    #
+    # 重试是直接再调一次 ``item.runtest()``，allure 的用例容器这期间
+    # 一直开着 —— 第一次失败时贴的"请求响应/失败归因/异常详情"和
+    # 各个 step 都会留在最终结果里，报告上就成了"通过"的用例挂着
+    # 红色的失败证据，步骤还重复两遍。
+    allure_result = _current_allure_result()
+    baseline = _snapshot_allure(allure_result)
+
     try:
         return (yield)
     except BaseException as exc:  # noqa: BLE001 - 要判断该不该重试
@@ -171,6 +191,15 @@ def pytest_runtest_call(item: pytest.Item) -> None:
             time.sleep(wait)
             wait *= backoff
 
+            # 重试前把上一次失败尝试的痕迹从 allure 结果里截掉 ——
+            # 否则最终"通过"的用例会带着失败时的步骤和附件
+            dropped = _drop_failed_attempt(allure_result, baseline)
+            if dropped:
+                log.info(
+                    "用例 %s 重试前清掉上一次失败留下的 %s 项报告内容",
+                    item.name, dropped,
+                )
+
             # 每次重试前清掉"上一次的状态"，好判断这次是不是环境问题
             from utils.http.request_handler import RequestHandler
 
@@ -198,6 +227,64 @@ def pytest_runtest_call(item: pytest.Item) -> None:
 
         # 重试完了还是失败
         raise exc
+
+
+#: 一次失败尝试会往 allure 结果里追加的东西。
+#: 重试前要把这些列表截回「尝试开始时」的长度。
+_ATTEMPT_ARTIFACTS = ("steps", "attachments", "labels", "links")
+
+
+def _current_allure_result() -> Any:
+    """当前用例正在写的 allure ``TestResult``（没装 allure 时返回 None）。
+
+    通过 ``allure_commons`` 的插件管理器找 listener，而不是直接 import
+    ``allure_pytest.listener`` —— 后者没装 allure 时导入就炸。
+    """
+    try:
+        from allure_commons._core import plugin_manager as allure_plugin_manager
+    except ImportError:  # pragma: no cover - 没装 allure
+        return None
+
+    for plugin in allure_plugin_manager.get_plugins():
+        reporter = getattr(plugin, "allure_logger", None)
+        if reporter is None:
+            continue
+        try:
+            return reporter.get_test(None)
+        except Exception:  # noqa: BLE001 - 拿不到就不清理，不能影响用例
+            return None
+    return None
+
+
+def _snapshot_allure(result: Any) -> dict[str, int] | None:
+    """记下各列表当前长度（重试后截回这里）。"""
+    if result is None:
+        return None
+    return {
+        name: len(getattr(result, name, []) or [])
+        for name in _ATTEMPT_ARTIFACTS
+    }
+
+
+def _drop_failed_attempt(result: Any, baseline: dict[str, int] | None) -> int:
+    """把失败尝试产生的步骤/附件/标签截掉。
+
+    Returns:
+        清掉了几项（0 = 没装 allure 或本来就没有可清的）。
+    """
+    if result is None or baseline is None:
+        return 0
+
+    dropped = 0
+    for name, keep in baseline.items():
+        items = getattr(result, name, None)
+        if not isinstance(items, list):
+            continue
+        extra = len(items) - keep
+        if extra > 0:
+            del items[keep:]
+            dropped += extra
+    return dropped
 
 
 def _should_retry(item: pytest.Item, exc: BaseException) -> bool:

@@ -59,6 +59,80 @@ class TestParseJsonResponse:
             parse_json_response("完全不是 JSON")
 
 
+class TestCasesPayload:
+    """模型返回形状漂移时的收敛逻辑。"""
+
+    def test_dict_with_cases(self) -> None:
+        from ai.capabilities.case_gen import _cases_from_payload
+
+        data = {"cases": [{"name": "a", "steps": [{}]}]}
+        assert _cases_from_payload(data) == data["cases"]
+
+    def test_bare_list(self) -> None:
+        from ai.capabilities.case_gen import _cases_from_payload
+
+        cases = [{"name": "a", "steps": [{}]}]
+        assert _cases_from_payload(cases) == cases
+
+    def test_wrapped_list(self) -> None:
+        from ai.capabilities.case_gen import _cases_from_payload
+
+        cases = [{"name": "a", "steps": [{}]}]
+        assert _cases_from_payload([{"cases": cases}]) == cases
+
+    def test_single_case_object(self) -> None:
+        from ai.capabilities.case_gen import _cases_from_payload
+
+        case = {"name": "a", "steps": [{}]}
+        assert _cases_from_payload(case) == [case]
+
+    def test_unrecognized_returns_none(self) -> None:
+        from ai.capabilities.case_gen import _cases_from_payload
+
+        assert _cases_from_payload({"Authorization": "x"}) is None
+        assert _cases_from_payload([1, 2]) is None
+        assert _cases_from_payload("text") is None
+
+    def test_json_candidates_scan_all_fragments(self) -> None:
+        from ai.capabilities.case_gen import _json_candidates
+
+        text = '推理里有 {"a": 1}，还有 [2, 3]，最后 {"cases": []}'
+        assert _json_candidates(text) == [{"a": 1}, [2, 3], {"cases": []}]
+
+
+class _ReasoningClient:
+    """先输出推理、最后才给 cases 的假客户端。"""
+
+    def __init__(self, text: str) -> None:
+        self.text = text
+        self.calls = 0
+
+    def chat(self, prompt: str, system: str = "", json_output: bool = False) -> str:
+        self.calls += 1
+        return self.text
+
+
+class TestCallAiJsonShapeDrift:
+    def test_finds_cases_after_reasoning(self) -> None:
+        from ai.capabilities.case_gen import _call_ai_json
+
+        cases = [{"name": "新增品牌（正常请求）", "steps": [{"path": "/admin/brand"}]}]
+        text = 'We need produce JSON. Example {"Authorization": "Bearer x"}. Final: ' + json.dumps(
+            {"cases": cases}, ensure_ascii=False
+        )
+        data = _call_ai_json(_ReasoningClient(text), "p", "s")
+        assert data == {"cases": cases}
+
+    def test_retries_when_payload_has_no_cases(self, monkeypatch) -> None:
+        from ai.capabilities.case_gen import _call_ai_json
+
+        monkeypatch.setattr("ai.capabilities.case_gen.time.sleep", lambda _: None)
+        client = _ReasoningClient('{"Authorization": "Bearer x"}')
+        with pytest.raises(Exception):
+            _call_ai_json(client, "p", "s")
+        assert client.calls == 3
+
+
 # ---------------------------------------------------------------------------
 # 客户端配置
 # ---------------------------------------------------------------------------

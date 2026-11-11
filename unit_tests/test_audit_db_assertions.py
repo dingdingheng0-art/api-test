@@ -98,3 +98,122 @@ class TestCollectAssertTypes:
         out: set[str] = set()
         audit.collect_assert_types([{"type": "db_query"}], out)
         assert "db_query" in out
+
+
+def test_teardown_db_assert_is_reported_as_misplaced(
+    audit, tmp_path, monkeypatch, capsys
+) -> None:
+    """后置里的落库断言不能抵覆盖率，要单列成「放错位置」。"""
+    import json
+
+    import openpyxl
+
+    module_dir = tmp_path / "admin_area"
+    module_dir.mkdir()
+    path = module_dir / "admin_area.xlsx"
+
+    headers = ["用例ID", "接口", "请求方法", "断言", "前置", "后置", "用例状态", "用例名称"]
+    values = {
+        "用例ID": "API-001",
+        "接口": "/admin/area",
+        "请求方法": "POST",
+        "断言": json.dumps(
+            [{"check": "body", "jsonpath": "$.success", "comparator": "==", "expect": True}]
+        ),
+        "前置": "",
+        "后置": json.dumps(
+            [
+                {
+                    "id": "查数据",
+                    "operation_type": "api",
+                    "path": "/admin/area/page",
+                    "method": "GET",
+                    "assert": [
+                        {"check": "db", "sql": "SELECT 1", "comparator": "exists"}
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        "用例状态": "debugged",
+        "用例名称": "新增地区",
+    }
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = audit.SHEET
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(1, idx).value = header
+        ws.cell(2, idx).value = values[header]
+    wb.save(path)
+
+    monkeypatch.setattr(audit, "CASE_ROOT", tmp_path)
+    code = audit.audit(False)
+    out = capsys.readouterr().out
+
+    assert code == 1
+    assert "放在后置" in out
+    assert "API-001" in out
+
+
+def test_cleanup_delete_db_assert_is_allowed(
+    audit, tmp_path, monkeypatch, capsys
+) -> None:
+    """后置 DELETE 上的「删后查不到」是清理验证，不算放错位置。"""
+    import json
+
+    import openpyxl
+
+    module_dir = tmp_path / "admin_area"
+    module_dir.mkdir()
+    path = module_dir / "admin_area.xlsx"
+
+    headers = ["用例ID", "接口", "请求方法", "断言", "前置", "后置", "用例状态", "用例名称"]
+    values = {
+        "用例ID": "API-002",
+        "接口": "/admin/area",
+        "请求方法": "POST",
+        "断言": json.dumps(
+            [
+                {"check": "body", "jsonpath": "$.success", "comparator": "==", "expect": True},
+                {"check": "db", "sql": "SELECT area_id FROM tz_area WHERE area_id = %s",
+                 "comparator": "exists"},
+            ]
+        ),
+        "前置": "",
+        "后置": json.dumps(
+            [
+                {
+                    "id": "清理数据",
+                    "operation_type": "api",
+                    "path": "/admin/area/1",
+                    "method": "DELETE",
+                    "assert": [
+                        {
+                            "check": "db",
+                            "sql": "SELECT area_id FROM tz_area WHERE area_id = %s",
+                            "comparator": "not_exists",
+                        }
+                    ],
+                }
+            ],
+            ensure_ascii=False,
+        ),
+        "用例状态": "debugged",
+        "用例名称": "新增地区",
+    }
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = audit.SHEET
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(1, idx).value = header
+        ws.cell(2, idx).value = values[header]
+    wb.save(path)
+
+    monkeypatch.setattr(audit, "CASE_ROOT", tmp_path)
+    code = audit.audit(False)
+    out = capsys.readouterr().out
+
+    assert code == 0
+    assert "放在后置" not in out

@@ -29,7 +29,24 @@ from utils.infra.mock_server import MockConnectionError, get_registry
 from utils.config.project_profile import ProjectRegistry
 from testcases.project_login_handler import ProjectLoginHandler
 from utils.http.request_handler import RequestHandler
+from utils.infra.safety_guard import DangerousRequestBlocked
 from utils.cases.variable_resolver import VariableResolver
+
+
+class CleanupTargetMissing(AssertionError):
+    """后置清理的目标（通常是 id）没取到。
+
+    典型来源：``{{tools.max_id(...)}}`` 在查询结果为空时返回 ``None``。
+    以前会把它拼进路径，发出 ``DELETE /admin/xxx/None`` —— 接口回
+    A00005，报告上多一条和真实失败无关的噪音。
+
+    现在不发这个请求，改成：
+    * 用例本来就失败了 → 记日志跳过（数据多半压根没造出来）
+    * 用例是通过的     → 抛这个异常，明确说"没清干净"，而不是 A00005
+
+    继承 AssertionError：和 ``TeardownError`` 一样，这是"环境没清干净"
+    的用例失败，不是框架自己坏了（不该记成 error）。
+    """
 
 
 class TeardownError(AssertionError):
@@ -116,6 +133,12 @@ def _teardown_deletes_case_data(
     那是"用例写错了"或者"路径配错了"，不该悄悄删掉环境里的真实数据 ——
     这种仍然要过安全闸（命中受保护路径就会被拦下并明确失败）。
 
+    **但"用例写过数据"不足以放行**：``DELETE /admin/brand/100`` 这种
+    硬编码目标的清理，删的是环境里的第 100 条品牌，不是本用例造的那条。
+    以前只要用例有任写步骤就无条件放行，等于给这类 teardown 开了绿灯。
+    现在必须先看到 ``{{...}}`` 引用（造数产出 / 查到的 id / tools.*），
+    否则一律不放行，由调用方拒绝执行。
+
     以前这里写死 ``allow_dangerous=True``，等于对后置清理完全关掉了安全闸。
     """
     if bool(teardown.get("allow_dangerous") or case.get("allow_dangerous")):
@@ -124,11 +147,27 @@ def _teardown_deletes_case_data(
     if _step_deletes_setup_data(case, teardown):
         return True
 
+    # 目标不可追溯（没有引用任何变量）→ 删的是固定数据，不放行。
+    if not _teardown_references_case_data(teardown):
+        return False
+
     writes = {"POST", "PUT", "PATCH", "DELETE"}
     for item in list(case.get("setups") or []) + list(case.get("steps") or []):
         if str(item.get("method") or "").upper() in writes:
             return True
     return False
+
+
+def _teardown_references_case_data(teardown: dict[str, Any]) -> bool:
+    """清理目标里有没有 ``{{...}}`` 变量引用（路径/参数/请求体）。
+
+    只看这三个字段：``Authorization: {{token}}`` 是鉴权头，不能拿它证明
+    "删的是自己造的数据"。
+    """
+    raw = " ".join(
+        str(teardown.get(key) or "") for key in ("path", "params", "data")
+    )
+    return "{{" in raw
 
 
 #: 不带 WHERE 就不许执行的 SQL（写操作）
@@ -214,14 +253,44 @@ class CaseRunner:
         self.assert_handler.evidence_sink = lambda evidence: attach_json(
             evidence, name="校验证据"
         )
+        # 每条断言包成 allure 子步骤 —— 否则报告里只有一个空的「校验结果」，
+        # 看不出到底校验了什么、期望什么。
+        self.assert_handler.step_sink = allure.step
+        # 断言失败时把断言定义和错误贴成附件（步骤标题放不下完整 SQL）
+        self.assert_handler.attach_sink = lambda content, name: attach_json(
+            content, name=name
+        )
         # 最近一条用例的请求日志（失败时贴进报告）
         self.last_request_log: str = ""
         self.last_request_records: list[dict[str, Any]] = []
         # 最近一个发出请求的步骤的信息（失败时用来归因）
         self.last_step_info: dict[str, Any] = {}
+        # setup 失败原因（run_case 里会重置；放这里是为了兼容直接调
+        # _run_setups 的单测，避免 except 分支 AttributeError）
+        self._setup_errors: list[str] = []
+        self._setup_failure_info: dict[str, Any] | None = None
+        #: ``prepare()`` 抛出的异常。
+        #:
+        #: pytest 下前置失败**不在 fixture 里抛**（那会让 allure 丢掉整个
+        #: Set up 区块，还会跳过 fixture 的 finalizer），而是记在这里，
+        #: 由用例体 ``test_api_case`` 抛出 —— 详见 testcases/test_cases.py
+        #: 的 ``case_lifecycle``。
+        self.prepare_error: BaseException | None = None
         # 当前正在跑的用例（name / module / params）—— 归因时用来确认
         # ``last_step_info`` 确实是这条用例的，而不是上一条留下的
         self._current_case: dict[str, Any] = {}
+        # 三段式执行的上下文（prepare 时写入，cleanup 时清掉）
+        self._active: dict[str, Any] | None = None
+        # 用例体有没有真的跑过（依赖结果落盘要用：setup 失败时不能记成通过）
+        self._body_ran = False
+        self._last_session_vars: dict[str, Any] = {}
+        #: 这条用例是否已经失败（setup / steps 抛过异常）。
+        #:
+        #: 后置清理用它区分「清理目标没取到」要不要报错：
+        #: - 用例本来就没过 → 目标没取到通常意味着数据压根没造出来，
+        #:   跳过即可，不能再往失败信息里加噪音
+        #: - 用例是通过的 → 目标没取到说明该清的没清，要明确报出来
+        self._case_failed = False
 
     # ---------------- 主入口 ----------------
 
@@ -232,22 +301,105 @@ class CaseRunner:
         param_vars: dict[str, Any] | None = None,
         module: str = "",
     ) -> dict[str, Any]:
-        """执行一条用例。
+        """执行一条完整用例（前置 + 步骤 + 后置）。
 
-        Args:
-            case_data: 已解析的 YAML 字典（形如 ``{"testcase": {...}}``）
-            project_name: 用例所属项目（决定默认 host 与登录配置）
-            param_vars: 当前参数组的变量（参数化时传入）
-            module: 所属模块（失败时用来标注"这是哪个模块的锅"）
+        保留这个入口是为了兼容直接调用运行器的场景（单测、维护工具）。
+        pytest 里走的是 fixture 驱动的 ``prepare / execute / cleanup``
+        三段式 —— Allure 只会把 fixture 里的前置/后置放进
+        Set up / Tear down 区块，用例体里的步骤只会进 Test body。
 
         Returns:
             这条用例的步骤变量（``{步骤ID: 响应}``）——
             依赖它的下游用例要用它。
         """
+        original_error: BaseException | None = None
+        try:
+            self.prepare(
+                case_data, project_name, param_vars=param_vars, module=module
+            )
+            self.execute()
+        except BaseException as exc:
+            original_error = exc
+            raise
+        finally:
+            # teardown 会把 ``last_step_info`` 改成清理请求。用例本来已经失败时，
+            # 归因必须看**原始失败那一步**（setup / steps），而不是清理请求 ——
+            # 否则报告会拿 DELETE 的响应去解释一个断言失败。
+            info_before_teardown = dict(self.last_step_info)
+            try:
+                self.cleanup()
+            except Exception as cleanup_exc:  # noqa: BLE001
+                # 清理失败不能盖住原始失败原因。
+                #
+                # 两种情况分开处理：
+                # - 用例本来就没过 → 保留原始失败，把清理失败作为附加信息
+                # - 用例本来是过的   → 清理失败就是本次唯一的失败原因
+                if original_error is not None:
+                    self._attach_cleanup_error(original_error, cleanup_exc)
+                    log.error(
+                        "teardown 清理失败（已附在原始失败原因上）: %s", cleanup_exc
+                    )
+                else:
+                    raise TeardownError(
+                        f"用例 {self._current_case.get('name', '')} "
+                        f"执行完成，但后置清理失败: {cleanup_exc}"
+                    ) from cleanup_exc
+            # 用例已有原始失败 → 归因用失败那一步，而不是刚才的清理请求。
+            if original_error is not None:
+                self.last_step_info = info_before_teardown
+
+        log.info("用例 %s 执行完成", self._current_case.get("name", ""))
+
+        # 返回步骤变量 —— 依赖这条用例的下游用例要用
+        return self._last_session_vars
+
+    # ---------------- 三段式（pytest fixture 用） ----------------
+
+    def prepare(
+        self,
+        case_data: dict[str, Any],
+        project_name: str,
+        param_vars: dict[str, Any] | None = None,
+        module: str = "",
+    ) -> None:
+        """执行准备，并记下"这条用例已经失败了"。
+
+        失败标记有两个用处：
+
+        * 后置清理目标没取到时，决定是静默跳过还是报失败
+          （见 ``_run_teardowns``）
+        * 包装放在这里而不是调用方，是为了让 pytest 三段式和
+          ``run_case`` 两条路径都覆盖到
+        """
+        try:
+            self._prepare(case_data, project_name, param_vars=param_vars, module=module)
+        except BaseException:
+            self._case_failed = True
+            raise
+
+    def _prepare(
+        self,
+        case_data: dict[str, Any],
+        project_name: str,
+        param_vars: dict[str, Any] | None = None,
+        module: str = "",
+    ) -> None:
+        """校验用例、加载依赖、登录、执行 setups。
+
+        失败时抛异常（setup 断言失败是 ``AssertionError``）。
+
+        pytest 下 ``case_lifecycle`` 会接住这个异常记到
+        ``prepare_error``，由用例体抛出 —— 放在 fixture 里抛的话，
+        allure 会把整个 Set up 区块丢掉（见 test_cases.py 的说明）。
+
+        失败后 ``cleanup()`` 仍然要跑（setup 可能已经造了一半的数据），
+        所以 ``_active`` 在跑 setups **之前**就记下了。
+        """
+        # 上一轮的前置异常绝不能留到这一轮 —— 用例校验（validate_test_data）
+        # 本身就可能是抛异常的地方，放在它后面清就已经晚了。
+        self.prepare_error = None
         validate_test_data(case_data)
         case = case_data["testcase"]
-        has_setup = validate_setups(case.get("setups"))
-        has_teardown = validate_teardowns(case.get("teardowns"))
         param_vars = param_vars or {}
 
         # 归因用的"最近请求"必须从**这条用例**开始算。
@@ -257,6 +409,15 @@ class CaseRunner:
         # 用例的 —— 归因会拿别人的响应去分析，得出"服务端返回 A00005"这种
         # 完全不沾边的结论。
         self.last_step_info = {}
+        # setup 失败的原始原因和当时那一步的信息。
+        # 不记的话，`_run_setups` 只返回 False，最终抛出的
+        # 「setup 执行失败」看不到到底是哪条断言、报了什么错。
+        self._setup_errors = []
+        self._setup_failure_info = None
+        self._body_ran = False
+        self._last_session_vars = {}
+        self._active = None
+        self._case_failed = False
         self._current_case = {
             "name": str(case.get("name") or ""),
             "module": module,
@@ -303,7 +464,9 @@ class CaseRunner:
         dependencies = [str(d).strip() for d in dependencies if str(d).strip()]
 
         if dependencies:
-            self._load_dependency_outputs(dependencies, resolver, str(case.get("name") or ""))
+            self._load_dependency_outputs(
+                dependencies, resolver, str(case.get("name") or "")
+            )
 
         # 需要登录的项目先登录一次
         self._login_projects(case, project_name)
@@ -314,58 +477,106 @@ class CaseRunner:
         #    下游用例就取不到「{{上游用例.步骤.字段}}」了。
         resolver.global_vars.update(Globals.get_data())
 
-        # setup 失败 → 不跑 steps，但 teardown 仍然要跑
-        # （setup 可能已经造了一半的数据，得清掉）
-        #
-        # ⚠️ 关键：**用异常变量记住原始失败原因**。
-        #    如果直接写 ``finally: self._run_teardowns(...)``，
-        #    teardown 自己抛异常时，会把上面 steps 的真实失败原因盖掉 ——
-        #    报告里只能看到"清理失败"，看不到"哪条断言挂了"。
-        #    所以这里先把原始异常存下来，teardown 的异常作为
-        #    **附加信息**附在原始异常上，而不是替换它。
-        original_error: BaseException | None = None
+        # 先登记上下文再跑 setups —— setup 失败时 cleanup() 还要靠它
+        # 找到 teardowns / resolver / 请求日志。
+        self._active = {
+            "case": case,
+            "project": project_name,
+            "resolver": resolver,
+            "session_vars": session_vars,
+            "module": module,
+            "logger": request_logger,
+        }
+
+        if validate_setups(case.get("setups")) and not self._run_setups(
+            case, project_name, resolver, session_vars, module=module
+        ):
+            # setup 失败 = 用例失败（不是 error —— 用例本身写得没问题，
+            # 是前置数据没造出来）。把第一个失败原因带上 ——
+            # 否则报告里只有一句"setup 执行失败"，看不出是哪条断言挂了。
+            if self._setup_failure_info:
+                self.last_step_info = dict(self._setup_failure_info)
+            detail = "；".join(self._setup_errors)
+            suffix = f"（{detail}）" if detail else ""
+            raise AssertionError(
+                f"用例 {case['name']} 的 setup 执行失败{suffix}，steps 未执行"
+            )
+
+    def execute(self) -> dict[str, Any]:
+        """执行用例步骤（pytest 用例体）。"""
+        active = self._active
+        if active is None:
+            raise RuntimeError("execute() 之前必须先调用 prepare()")
+
+        self._body_ran = True
         try:
-            if has_setup and not self._run_setups(
-                case, project_name, resolver, session_vars, module=module
-            ):
-                # setup 失败 = 用例失败（不是 error —— 用例本身写得没问题，
-                # 是前置数据没造出来）
-                raise AssertionError(f"用例 {case['name']} 的 setup 执行失败，steps 未执行")
-            self._run_steps(case, project_name, resolver, session_vars, module=module)
-        except BaseException as exc:
-            original_error = exc
+            self._run_steps(
+                active["case"],
+                active["project"],
+                active["resolver"],
+                active["session_vars"],
+                module=active["module"],
+            )
+        except BaseException:
+            self._case_failed = True
             raise
+        self._last_session_vars = active["session_vars"]
+        return active["session_vars"]
+
+    def cleanup(self) -> None:
+        """执行后置清理，并结算请求日志。
+
+        可以重复调用（第一次之后就是空操作）—— pytest fixture 的
+        finalizer 在 setup 失败时也会被调用。
+        """
+        active = self._active
+        if active is None:
+            return
+
+        case = active["case"]
+        try:
+            if validate_teardowns(case.get("teardowns")):
+                self._run_teardowns(
+                    case,
+                    active["project"],
+                    active["resolver"],
+                    active["session_vars"],
+                    module=active["module"],
+                )
         finally:
-            if has_teardown:
-                try:
-                    self._run_teardowns(
-                        case, project_name, resolver, session_vars, module=module
-                    )
-                except Exception as cleanup_exc:  # noqa: BLE001
-                    # 清理失败不能盖住原始失败原因。
-                    #
-                    # 两种情况分开处理：
-                    # - 用例本来就没过 → 保留原始失败，把清理失败作为附加信息
-                    # - 用例本来是过的   → 清理失败就是本次唯一的失败原因
-                    if original_error is not None:
-                        self._attach_cleanup_error(original_error, cleanup_exc)
-                        log.error(
-                            "teardown 清理失败（已附在原始失败原因上）: %s", cleanup_exc
-                        )
-                    else:
-                        raise TeardownError(
-                            f"用例 {case['name']} 执行完成，但后置清理失败: {cleanup_exc}"
-                        ) from cleanup_exc
             # 恢复默认（避免串到下一条用例）
             RequestHandler.set_request_logger(None)
             # 最后一条用例的请求日志留一份，失败时报告要用
-            self.last_request_log = request_logger.as_text()
-            self.last_request_records = request_logger.as_list()
+            logger = active["logger"]
+            self.last_request_log = logger.as_text()
+            self.last_request_records = logger.as_list()
+            self._active = None
 
-        log.info("用例 %s 执行完成", case["name"])
+    # ---------------- 三段式状态（给 fixture / 报告层读） ----------------
 
-        # 返回步骤变量 —— 依赖这条用例的下游用例要用
-        return session_vars
+    @property
+    def body_ran(self) -> bool:
+        """用例体（steps）有没有真的跑过。
+
+        setup 失败时用例体不会执行，依赖结果不能记成 "passed"。
+        """
+        return self._body_ran
+
+    @property
+    def session_vars(self) -> dict[str, Any]:
+        """用例体执行后得到的步骤变量（依赖结果落盘用）。"""
+        return self._last_session_vars
+
+    def current_request_log(self) -> str:
+        """当前这条用例的请求日志。
+
+        前置失败时 ``cleanup()`` 还没跑，``last_request_log`` 还是上一条
+        用例的 —— 直接读它会把这轮的失败归到上一条用例的请求上。
+        """
+        active = self._active
+        if active is not None:
+            return active["logger"].as_text()
+        return self.last_request_log
 
     @staticmethod
     def _attach_cleanup_error(
@@ -520,8 +731,13 @@ class CaseRunner:
 
                 url = project_config["host"].rstrip("/") + resolver.process_data(step["path"])
                 # 默认头（配置里的）+ 用例自己的头（覆盖默认值）
+                #
+                # 标了 no_auth 的用例**故意**不带鉴权头（测未登录/越权）。
+                # 否则框架自动补 token，C1 维度永远测不出来。
                 headers = {
-                    **self._default_headers(step_project, resolver),
+                    **self._default_headers(
+                        step_project, resolver, skip_auth=self._skips_auth(case)
+                    ),
                     **(resolver.process_data(step.get("headers")) or {}),
                 }
                 data = resolver.process_data(step.get("data"))
@@ -562,6 +778,24 @@ class CaseRunner:
                 )
 
                 # ---- 2. 发送请求 ----
+                #
+                # 请求还没拿到响应就先把步骤上下文记上。
+                #
+                # ``last_step_info`` 之前只在拿到响应之后才写，所以「发送阶段
+                # 抛异常」（安全闸拦截、连接超时、DNS 失败）时会停在登录时写的
+                # ``{"stage": "login"}`` —— 归因把「DELETE 被安全闸拦下」误报成
+                # 「登录失败：DangerousRequestBlocked」，排查方向完全跑偏。
+                # response / meta 先留空，成功后再覆盖成真实值。
+                self.last_step_info = {
+                    "stage": "step",
+                    "step_id": step_id,
+                    "method": step["method"],
+                    "url": url,
+                    "path": resolver.process_data(step["path"]),
+                    "module": module,
+                    "response": None,
+                    "meta": None,
+                }
                 with allure.step("发送请求"):
                     if mocked is not None:
                         response, meta = mocked
@@ -585,6 +819,8 @@ class CaseRunner:
                             or _step_deletes_setup_data(case, step),
                             # 下载类接口（导出 Excel）返回二进制，别按 JSON 解析
                             response_type=str(step.get("response_type") or "json"),
+                            # 匿名用例被拒绝是「预期结果」，不能重登录后重试
+                            skip_auth=self._skips_auth(case),
                         )
 
                     # 响应体单独贴一个附件
@@ -600,6 +836,7 @@ class CaseRunner:
                     # 记下这个步骤的信息 —— 断言失败时用来归因
                     # （是服务端返回的错，还是用例自己写错了）
                     self.last_step_info = {
+                        "stage": "step",
                         "step_id": step_id,
                         "method": step["method"],
                         "url": url,
@@ -914,6 +1151,17 @@ class CaseRunner:
                     # 全部跑完再统一返回 False，让 teardown 有完整的机会清理。
                     log.error("setup %s 失败: %s", su_id, exc)
                     attach_error(exc, name=f"{su_id}-失败详情")
+                    # 记第一个失败原因 —— 最终抛出的 "setup 执行失败" 会带上它。
+                    # 后面的 setup 仍会继续跑（清理机会），但原因不再被覆盖。
+                    self._setup_errors.append(
+                        f"{su_id}: {type(exc).__name__}: {exc}"
+                    )
+                    if self._setup_failure_info is None:
+                        self._setup_failure_info = (
+                            dict(self.last_step_info)
+                            if self.last_step_info
+                            else {"stage": "setup", "step_id": su_id}
+                        )
                     failed = True
 
         return not failed
@@ -948,7 +1196,41 @@ class CaseRunner:
             with allure.step(f"后置 {td_id} ({op})"):
                 try:
                     if op == "api":
-                        url = project_config["host"].rstrip("/") + resolver.process_data(teardown["path"])
+                        allow_dangerous = _teardown_deletes_case_data(case, teardown)
+                        # 安全闸只拦 DELETE（且要命中受保护路径）。``PUT
+                        # /admin/message/cancel/1`` 这类"改状态"清理杀的是
+                        # 真实记录，闸门管不到 —— 在这里补一道：
+                        # 目标不可追溯的写后置，一律拒绝执行。
+                        if (
+                            not allow_dangerous
+                            and str(teardown.get("method") or "").upper()
+                            in {"POST", "PUT", "PATCH", "DELETE"}
+                        ):
+                            raise DangerousRequestBlocked(
+                                "后置清理拒绝执行："
+                                f"{teardown.get('method')} {teardown.get('path')} "
+                                "没有引用本用例造数产出的 id，删/改的是环境里的固定数据。"
+                                "确需保留请显式加 allow_dangerous。"
+                            )
+                        # 目标 id 没取到就别发请求。
+                        #
+                        # ``{{tools.max_id(...)}}`` 在查询结果为空时返回 None，
+                        # 拼进路径就是 ``DELETE /admin/xxx/None`` —— 接口回
+                        # A00005，报告上凭空多一条和真实失败无关的噪音。
+                        # 数据本来就没造出来，不发这个请求也不会漏删。
+                        #
+                        # 只在**整段表达式求值为 None**时拦；拼接场景里的
+                        # None 会被转成字符串（``/x/None``），那种多半是用例
+                        # 自己写错了，保持原样让它失败，别悄悄吞掉。
+                        missing: list[str] = []
+                        raw_path = teardown.get("path")
+                        td_path = resolver.process_data(raw_path, missing)
+                        if missing or td_path is None:
+                            detail = "、".join(missing) or repr(raw_path)
+                            self._skip_teardown_with_missing_target(td_id, detail)
+                            continue
+
+                        url = project_config["host"].rstrip("/") + td_path
                         RequestHandler.set_rate_limit_key(td_project)
                         # 默认头（含鉴权头）+ 用例自己写的头，和普通步骤一致。
                         #
@@ -960,6 +1242,15 @@ class CaseRunner:
                             **self._default_headers(td_project, resolver),
                             **(resolver.process_data(teardown.get("headers")) or {}),
                         }
+                        # 查询参数 / 请求体同理：目标 id 一般也在里面，
+                        # 求值为 None 一样会拼成 "xxx=None"。
+                        td_params = resolver.process_data(teardown.get("params"), missing)
+                        td_data = resolver.process_data(teardown.get("data"), missing)
+                        if missing:
+                            self._skip_teardown_with_missing_target(
+                                td_id, "、".join(missing)
+                            )
+                            continue
                         # 走重登录通道 —— 和 steps / setup 一致。
                         #
                         # 清理常常排在套件最后，这时候 token 可能已经被
@@ -970,21 +1261,19 @@ class CaseRunner:
                             method=teardown["method"],
                             url=url,
                             headers=headers,
-                            data=resolver.process_data(teardown.get("data")),
-                            params=resolver.process_data(teardown.get("params")),
+                            data=td_data,
+                            params=td_params,
                             files=None,
                             # 安全闸：删的是本用例自己造的数据才放行。
-                            # 以前这里写死 True —— 等于后置清理完全绕过了
-                            # 防误删。现在按「有没有写过数据」判，
-                            # 纯查询用例里误配的 DELETE 仍会被拦下。
-                            allow_dangerous=_teardown_deletes_case_data(case, teardown),
+                            # 上面已经拦掉了目标不可追溯的写后置。
+                            allow_dangerous=allow_dangerous,
                         )
                         session_vars[td_id] = response
                         self.last_step_info = {
                             "step_id": td_id,
                             "method": teardown["method"],
                             "url": url,
-                            "path": resolver.process_data(teardown["path"]),
+                            "path": td_path,
                             "module": module,
                             "response": response,
                             "meta": meta,
@@ -1068,6 +1357,25 @@ class CaseRunner:
             }
         else:
             session_vars[session_vars_id] = result
+
+    def _skip_teardown_with_missing_target(self, td_id: str, detail: str) -> None:
+        """清理目标没取到：用例已失败则跳过，否则抛 ``CleanupTargetMissing``。
+
+        - 用例已经失败：数据多半没造出来，再报一条只会盖住根因
+        - 用例是通过的：该清的没清，必须明确报出来（而不是发一个
+          ``DELETE /xxx/None`` 换回一个看不懂的 A00005）
+        """
+        if self._case_failed:
+            log.info("teardown %s 跳过：目标未取到（%s）", td_id, detail)
+            attach_text(
+                f"清理目标未取到，跳过：{detail}",
+                name=f"{td_id}-跳过说明",
+            )
+            return
+        raise CleanupTargetMissing(
+            f"清理目标未取到：{detail} 求值为 None，未发出清理请求 —— "
+            "该清的没清，可能留下了脏数据。"
+        )
 
     def _run_factory_cleanup(self, item: dict[str, Any]) -> None:
         """清理工厂造的数据。
@@ -1159,6 +1467,7 @@ class CaseRunner:
         files: Any,
         allow_dangerous: bool = False,
         response_type: str = "json",
+        skip_auth: bool = False,
     ) -> tuple[Any, dict[str, Any]]:
         """发请求；遇到"登录态失效"就重新登录再重试一次。
 
@@ -1173,6 +1482,11 @@ class CaseRunner:
 
         只重试一次 —— 反复重试说明是账号本身的问题（密码错了、被禁用了），
         那种情况应该直接报错，而不是把登录接口打爆。
+
+        ``skip_auth=True`` 时**绝不重登录**：这条请求是故意匿名的
+        （未登录 / 越权用例），"未授权"正是要验证的结果。以前这里会把
+        A00004 当成登录态失效，自动补 token 再发一次，导致 C1 用例实际
+        带着 token 跑，服务端返回成功，反例被误判成失败。
         """
         response, meta = RequestHandler.send_with_retry_full(
             method=method,
@@ -1185,7 +1499,7 @@ class CaseRunner:
             response_type=response_type,
         )
 
-        if not RequestHandler.is_unauthorized(response):
+        if skip_auth or not RequestHandler.is_unauthorized(response):
             return response, meta
 
         log.warning(
@@ -1287,7 +1601,30 @@ class CaseRunner:
             raise ValueError(f"项目 {project_name!r} 在环境 {self.env!r} 下没有配置")
         return loaded[project_name]
 
-    def _default_headers(self, project_name: str, resolver: VariableResolver) -> dict[str, Any]:
+    @staticmethod
+    def _skips_auth(case: Any) -> bool:
+        """用例是否**故意**不带鉴权头（测未登录 / 越权）。
+
+        只在主步骤上生效：前置/后置属于测试脚手架，仍然要正常鉴权。
+        """
+        if not isinstance(case, dict):
+            return False
+        if case.get("no_auth"):
+            return True
+        marks = case.get("marks") or []
+        if isinstance(marks, str):
+            marks = marks.replace(";", ",").split(",")
+        return bool(
+            {str(m).strip().lower() for m in marks}
+            & {"no_auth", "noauth", "unauthenticated"}
+        )
+
+    def _default_headers(
+        self,
+        project_name: str,
+        resolver: VariableResolver,
+        skip_auth: bool = False,
+    ) -> dict[str, Any]:
         """算这个项目的默认请求头。
 
         配置里可以写 ``headers:``（支持变量），比如：
@@ -1325,11 +1662,20 @@ class CaseRunner:
 
         # 登录后自动带上鉴权头 ——
         # 用例里没写鉴权头时，框架补上（写了就以用例的为准）
-        if profile is not None:
+        if profile is not None and not skip_auth:
             project_data = Globals.get_data().get(project_name, {}) or {}
             token = project_data.get(profile.token_var)
             session = project_data.get(profile.session_var)
             for key, value in profile.auth_headers(token, session).items():
                 headers.setdefault(key, value)
+        elif profile is not None and skip_auth:
+            # 故意匿名：配置里若写了鉴权头，也要摘掉
+            auth_names = {
+                str(name).lower()
+                for name in (profile.token_header, profile.session_header)
+                if name
+            }
+            for key in [k for k in headers if str(k).lower() in auth_names]:
+                headers.pop(key, None)
 
         return headers

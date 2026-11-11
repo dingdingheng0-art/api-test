@@ -12,7 +12,7 @@ from pathlib import Path
 
 import pytest
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent.parent
+PROJECT_ROOT = Path(__file__).resolve().parent.parent
 if str(PROJECT_ROOT) not in sys.path:
     sys.path.insert(0, str(PROJECT_ROOT))
 
@@ -89,7 +89,7 @@ def test_openapi_extracts_response_example(openapi_endpoints):
 
 
 def test_openapi_base_url(openapi_endpoints):
-    assert all(e.base_url == "http://103.236.97.137:8190/_admin" for e in openapi_endpoints)
+    assert all(e.base_url == "https://admin-api.pickmall.cn" for e in openapi_endpoints)
 
 
 def test_openapi_path_param_extracted(openapi_endpoints):
@@ -114,7 +114,7 @@ def test_swagger2_parses(swagger2_endpoints):
 
 def test_swagger2_applies_base_path(swagger2_endpoints):
     """Swagger 2.0 的 basePath 要拼到路径前面。"""
-    assert all(e.path.startswith("/admin/") for e in swagger2_endpoints)
+    assert all(e.path.startswith("/manager/") for e in swagger2_endpoints)
 
 
 def test_swagger2_resolves_ref_in_body(swagger2_endpoints):
@@ -147,8 +147,8 @@ def test_har_parses_entries(har_endpoints):
 def test_har_extracts_url_parts(har_endpoints):
     ep = har_endpoints[0]
     assert ep.method == "GET"
-    assert ep.path == "/admin/user/info"
-    assert ep.base_url == "http://103.236.97.137:8190/_admin"
+    assert ep.path == "/manager/passport/user/info"
+    assert ep.base_url == "https://admin-api.pickmall.cn"
 
 
 def test_har_extracts_query_and_body(har_endpoints):
@@ -185,7 +185,7 @@ def test_curl_parses_multiple_commands(curl_endpoints):
 def test_curl_extracts_method_and_path(curl_endpoints):
     ep = next(e for e in curl_endpoints if "goods" in e.path)
     assert ep.method == "POST"
-    assert ep.path == "/prod/prod/detail"
+    assert ep.path == "/manager/goods/detail"
 
 
 def test_curl_extracts_json_body(curl_endpoints):
@@ -227,7 +227,9 @@ def test_curl_handles_single_line():
         ("/admin/statistics/order", "statistics"),
         ("/order/list", "order"),
         ("/api/v1/goods/detail", "goods"),
-        ("/admin/user/info", "passport"),
+        ("/manager/passport/user/info", "passport"),
+        # admin 只是后台入口前缀，不是模块名
+        ("/admin/user/info", "user"),
     ],
 )
 def test_infer_module(path, expected):
@@ -243,7 +245,7 @@ def test_build_step_separates_query_and_body(openapi_endpoints):
     ep = next(e for e in openapi_endpoints if e.method == "POST")
     step = build_step(ep)
     assert step["method"] == "POST"
-    assert step["path"] == "/order/list"
+    assert step["path"] == "/manager/order/list"
     assert "params" not in step          # body 字段不该进 params
     assert step["data"]["orderNo"] == "SO202401010001"
 

@@ -18,6 +18,7 @@
 """
 from __future__ import annotations
 
+import copy
 from pathlib import Path
 from typing import Any
 
@@ -36,6 +37,61 @@ STRUCTURE_FILES = ("module.yaml", "interfaces.yaml")
 # 校验器（进程内复用，不重复读 Schema 文件）
 _validator = CaseValidator()
 
+# ``load_cases_from_file`` 的进程内缓存：key = (文件, mtime_ns, size, 根目录, 项目)
+#
+# 收集阶段一个文件会被读好几遍（算标签、生成参数化、写 HTML 报告各一次），
+# 每次都重新解析 YAML / Excel + 校验 + 展开接口定义。文件没改就没必要重读。
+#
+# 用 mtime + size 做失效判断：改了文件自然失效，不用手动清缓存。
+# 命中时返回**深拷贝** —— 调用方会往用例数据里写运行时字段，
+# 直接返回缓存对象会让下一轮读到上一轮的脏数据。
+_LOAD_CACHE: dict[tuple[str, int, int, int, str, str], list[dict[str, Any]]] = {}
+_LOAD_CACHE_MAX = 512
+
+
+def clear_load_cache() -> None:
+    """清空用例文件缓存（改文件后测试里用，避免 mtime 精度问题）。"""
+    _LOAD_CACHE.clear()
+
+
+def _load_cache_key(
+    path: Path, root: Path, project: str
+) -> tuple[str, int, int, int, str, str] | None:
+    """算缓存 key；文件读不到属性时返回 None（不缓存，照常读）。
+
+    key 里带上同目录 ``module.yaml`` 的 mtime —— 模块标签会合并进用例，
+    只盯着用例文件本身会漏掉"改了 module.yaml 却没生效"。
+    """
+    try:
+        st = path.stat()
+        meta_file = path.parent / "module.yaml"
+        meta_mtime = meta_file.stat().st_mtime_ns if meta_file.exists() else 0
+        return (
+            str(path.resolve()),
+            st.st_mtime_ns,
+            st.st_size,
+            meta_mtime,
+            str(root.resolve()),
+            project,
+        )
+    except OSError:
+        return None
+
+
+def _remember_load_result(
+    key: tuple[str, int, int, int, str, str] | None,
+    result: list[dict[str, Any]],
+) -> list[dict[str, Any]]:
+    """把结果存进缓存，同时把这份新对象直接返回给当前调用方。"""
+    if key is None:
+        return result
+    if len(_LOAD_CACHE) >= _LOAD_CACHE_MAX:
+        _LOAD_CACHE.clear()
+    # 存副本：当前调用方会继续改这些 dict（加运行时字段），
+    # 不能让它把缓存里的"干净版本"改脏。
+    _LOAD_CACHE[key] = copy.deepcopy(result)
+    return result
+
 
 def load_yaml_file(path: Path) -> dict[str, Any]:
     """读一个 YAML 文件。"""
@@ -43,14 +99,6 @@ def load_yaml_file(path: Path) -> dict[str, Any]:
         data = yaml.safe_load(f)
     if not isinstance(data, dict):
         raise TestCaseError(f"{path} 顶层必须是字典")
-    return data
-
-
-def load_case_file(path: Path) -> dict[str, Any]:
-    """读并校验一个用例文件（旧格式）。"""
-    data = load_yaml_file(path)
-    validate_test_data(data)
-    _validate_format(data, path)
     return data
 
 
@@ -241,6 +289,51 @@ def discover_cases(
     return found
 
 
+def filter_case_files(
+    candidates: list[tuple[str, Path]],
+    *,
+    projects: Any = None,
+    modules: Any = None,
+    files: Any = None,
+) -> list[tuple[str, Path]]:
+    """按项目 / 模块 / 文件筛选用例文件。
+
+    ``scripts/run.py``（列出用例）和 ``framework/pytest_plugin.py``（收集用例）
+    都要做同一件事。以前两处各写一份，筛选规则改一处忘一处 ——
+    "清单里列出的条数"和"实际跑的条数"就对不上了。
+
+    Args:
+        candidates: ``[(项目名, 文件路径), ...]``
+        projects: 只保留这些项目（空/None 表示不限）
+        modules: 只保留这些模块目录（``case_loader`` 相对路径的第一段）
+        files: 只保留这些文件（``Path`` 或字符串都行，按绝对路径比较）
+
+    Returns:
+        筛选后的列表（保持原顺序）
+    """
+    project_set = set(projects or ())
+    module_set = set(modules or ())
+
+    result = candidates
+    if project_set:
+        result = [(p, f) for p, f in result if p in project_set]
+
+    if module_set:
+        # 目录结构是 <项目>/<模块>/<用例文件>，模块名 = 相对路径的第 2 段
+        result = [
+            (p, f)
+            for p, f in result
+            if relative_case_path(f).parts[1:2]
+            and relative_case_path(f).parts[1] in module_set
+        ]
+
+    if files:
+        wanted = {str(Path(f).resolve()) for f in files}
+        result = [(p, f) for p, f in result if str(Path(f).resolve()) in wanted]
+
+    return result
+
+
 def find_data_file(api_file: Path) -> Path | None:
     """给接口定义文件找对应的测试数据文件。
 
@@ -321,6 +414,12 @@ def load_cases_from_file(
         except (ValueError, OSError):
             project = ""
 
+    cache_key = _load_cache_key(path, root, project)
+    if cache_key is not None:
+        cached = _LOAD_CACHE.get(cache_key)
+        if cached is not None:
+            return copy.deepcopy(cached)
+
     if path.suffix.lower() in (".xlsx", ".xlsm"):
         from utils.excel.loader import load_excel_cases
 
@@ -341,7 +440,7 @@ def load_cases_from_file(
                 if not allure.get("feature") and merged_meta.get("label"):
                     allure["feature"] = merged_meta["label"]
 
-        return cases
+        return _remember_load_result(cache_key, cases)
 
     case = load_any_case(path, root)
 
@@ -352,7 +451,7 @@ def load_cases_from_file(
     module = _module_of_path(path, root)
     expanded = expand_case(case, project=project, module=module)
 
-    return [expanded]
+    return _remember_load_result(cache_key, [expanded])
 
 
 def _detect_root(path: Path) -> Path:
@@ -406,21 +505,3 @@ def relative_case_path(path: Path) -> Path:
         return path.resolve().relative_to(root.resolve())
     except (ValueError, OSError):
         return path.name
-
-
-def load_all_cases(root: Path | None = None) -> dict[str, list[dict[str, Any]]]:
-    """加载全部用例，按项目名分组。
-
-    Returns:
-        ``{项目名: [{"path": Path, "data": dict}, ...]}``
-    """
-    grouped: dict[str, list[dict[str, Any]]] = {}
-    for project, path in discover_cases(root):
-        try:
-            cases = load_cases_from_file(path, root)
-        except (TestCaseError, yaml.YAMLError) as exc:
-            log.error("用例文件 %s 解析失败：%s", path, exc)
-            continue
-        for data in cases:
-            grouped.setdefault(project, []).append({"path": path, "data": data})
-    return grouped

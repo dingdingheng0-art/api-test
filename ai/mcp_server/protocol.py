@@ -56,7 +56,14 @@ class RPCError(Exception):
 
 
 def read_message(stream: Any) -> dict[str, Any] | None:
-    """从流里读一条消息（一行一个 JSON）。读到 EOF 返回 None。"""
+    """从流里读一条消息（一行一个 JSON）。读到 EOF 返回 None。
+
+    **只收 JSON 对象**。合法 JSON 不等于合法消息：客户端发来
+    ``[1, 2]``（JSON-RPC 批量）、``"hi"``、``5`` 时 ``json.loads`` 都成功，
+    但主循环紧接着要取 ``message.get("id")`` —— 对 list 取 ``.get`` 直接
+    ``AttributeError``，而那句在 try 之外，**整个 stdio 服务会退出**，
+    用户得手动重连。所以在入口就把非对象挡成 JSON-RPC 错误。
+    """
     line = stream.readline()
     if not line:
         return None
@@ -64,9 +71,15 @@ def read_message(stream: Any) -> dict[str, Any] | None:
     if not line:
         return None
     try:
-        return json.loads(line)
+        data = json.loads(line)
     except ValueError as exc:
         raise RPCError(PARSE_ERROR, f"消息不是合法 JSON: {exc}") from exc
+    if not isinstance(data, dict):
+        raise RPCError(
+            INVALID_REQUEST,
+            f"消息必须是 JSON 对象，收到 {type(data).__name__}",
+        )
+    return data
 
 
 def write_message(stream: Any, payload: dict[str, Any]) -> None:

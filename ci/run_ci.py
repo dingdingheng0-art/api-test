@@ -31,15 +31,17 @@ import argparse
 import json
 import os
 import shutil
-import subprocess
 import sys
 import time
 from pathlib import Path
 from typing import Any
 
-PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(PROJECT_ROOT))
+# 只为把项目根塞进 sys.path；项目根的定义在 utils.paths 里，别处不再重复
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parent.parent
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
+
+from utils.paths import PROJECT_ROOT  # noqa: E402
 
 
 def _log(message: str) -> None:
@@ -105,10 +107,7 @@ def build_pytest_args(args: argparse.Namespace) -> list[str]:
     else:
         cmd += ["--alluredir", str(ALLURE_RESULTS)]
 
-    if not args.no_retry:
-        # 默认开着重试（环境抖动不判失败）
-        pass
-    else:
+    if args.no_retry:
         cmd += ["--no-retry"]
 
     # ---- JUnit XML ----
@@ -387,7 +386,7 @@ def main(argv: list[str] | None = None) -> int:
     parser.add_argument(
         "--notify", action="append", default=[],
         help="结果通知渠道：ding_ding / we_chat / feishu（可重复传）。"
-             "不传就从数据库 config_webhook 表读配置",
+             "不传就不发通知；Webhook 地址用 --notify-addr 传入",
     )
     parser.add_argument(
         "--notify-addr", default="",

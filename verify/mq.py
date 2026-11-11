@@ -54,7 +54,7 @@ import time
 from typing import Any, Protocol
 
 from utils.logs.log_manager import log
-from verify.errors import DependencyMissing, VerifyConfigError, VerifyError
+from verify.errors import DependencyMissing, VerifyConfigError
 
 
 class Message(dict):

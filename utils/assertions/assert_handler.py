@@ -103,6 +103,11 @@ class AssertHandler:
         #: 证据的落地方式（由调用方注入，比如贴进 allure 报告）。
         #: 为空就不落地 —— 断言逻辑本身不关心报告长什么样。
         self.evidence_sink: Callable[[list[dict[str, Any]]], None] | None = None
+        #: 把单条断言包成报告步骤的工厂（注入 ``allure.step``）。
+        #: 签名：``(title) -> 上下文管理器``。为空就退化成"只执行、不记录"。
+        self.step_sink: Callable[[str], Any] | None = None
+        #: 把断言明细贴进报告（注入 ``attach_json``）。只在失败时用。
+        self.attach_sink: Callable[..., None] | None = None
 
     def handle_assertion(
         self,
@@ -156,6 +161,78 @@ class AssertHandler:
     # ---------------- 单条断言 ----------------
 
     def _handle_one(
+        self,
+        assertion: dict[str, Any],
+        response: Any,
+        connection: Any,
+        meta: dict[str, Any] | None = None,
+    ) -> None:
+        """执行单条断言；注入了 ``step_sink`` 时把它包成报告步骤。
+
+        以前这里直接执行断言，报告里只有一个空的「校验结果」步骤 ——
+        跑了哪些断言、期望什么，看报告的人一概不知道。现在每条断言
+        都会成为「校验结果」下的一个子步骤，失败时再把断言定义和
+        错误信息贴成附件。
+        """
+        if self.step_sink is None:
+            self._evaluate(assertion, response, connection, meta)
+            return
+
+        label = self._describe(assertion)
+        with self.step_sink(label):
+            try:
+                self._evaluate(assertion, response, connection, meta)
+            except BaseException as exc:
+                if self.attach_sink is not None:
+                    self.attach_sink(
+                        {"断言": assertion, "错误": str(exc)},
+                        name=f"{label}-失败详情",
+                    )
+                raise
+
+    @staticmethod
+    def _describe(assertion: dict[str, Any]) -> str:
+        """把一条断言写成报告里一眼能看懂的一句话。
+
+        例：``code == '00000'``、``数据存在: SELECT id FROM tz_notice ...``。
+        """
+        raw_type = str(assertion.get("type") or "?").strip()
+        norm_type = raw_type.lower().replace(" ", "_")
+        field = assertion.get("field")
+        expected = assertion.get("expected")
+
+        # 数据库 / 缓存 / 消息队列：把目标也带上，不然看不出在查什么
+        if raw_type.startswith(("mysql", "db_")):
+            sql = str(assertion.get("query") or "").strip()
+            suffix = "" if expected is None else f" -> {expected!r}"
+            text = f"数据库断言 {raw_type}: {sql}{suffix}"
+        elif norm_type.startswith("redis_"):
+            text = f"缓存断言 {raw_type}: {assertion.get('key')}"
+            if expected is not None:
+                text += f" -> {expected!r}"
+        elif norm_type.startswith("mq_"):
+            text = f"消息断言 {raw_type}: {assertion.get('queue')}"
+            if expected is not None:
+                text += f" -> {expected!r}"
+        elif norm_type in ("exists", "field_exists") and field:
+            text = f"{field} 存在"
+        elif norm_type in ("not_exists", "field_not_exists") and field:
+            text = f"{field} 不存在"
+        elif field:
+            op = {
+                "equal": "==", "equals": "==",
+                "not_equal": "!=", "notequal": "!=",
+                "status_code": "状态码 ==", "status": "状态码 ==",
+                "http_status": "状态码 ==",
+            }.get(norm_type, norm_type)
+            text = f"{field} {op} {expected!r}"
+        else:
+            text = raw_type if expected is None else f"{raw_type} {expected!r}"
+
+        # 步骤标题过长会在报告里折成好几行，截一下
+        return text if len(text) <= 160 else text[:157] + "..."
+
+    def _evaluate(
         self,
         assertion: dict[str, Any],
         response: Any,
@@ -693,7 +770,12 @@ class AssertHandler:
             )
             return
 
-        row = client.query_one(query, params)
+        # ``query_one`` 本身就是 ``query(...)[0]`` ——
+        # 以前 db_query_exists 为了拿 evidence 又完整查了一遍，
+        # 同一条 SQL 跑两次（带 join / 聚合时代价翻倍）。
+        # 这里一次查完，行和 evidence 都用同一份结果。
+        rows = client.query(query, params) if norm_type == "db_query_exists" else None
+        row = rows[0] if rows is not None else client.query_one(query, params)
         result = self._pick_verify_column(row, column)
 
         self.evidence.append(
@@ -701,7 +783,7 @@ class AssertHandler:
                 "kind": "db",
                 "alias": alias,
                 "sql": query,
-                "rows": client.query(query, params) if norm_type == "db_query_exists" else None,
+                "rows": rows,
                 "actual": result,
             }
         )

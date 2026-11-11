@@ -17,8 +17,9 @@
 归因     依据
 ======== ==========================================================
 服务问题 服务端返回 403 / 404 / 5xx / A00005 / success=false
-用例数据 服务端返回参数校验错误（A00014）；或服务端的实际行为
-问题     和用例写死的预期不一致
+用例数据 服务端返回参数校验错误（A00014）；数据状态冲突（已存在 /
+问题     不存在 / 重复，常见于占位 id）；或服务端的实际行为和
+         用例写死的预期不一致；A00001 只有在 msg 提到权限时才算权限问题
 脚本问题 框架抛了非断言类异常（KeyError / TypeError / ValueError）
 环境问题 拿不到响应（连接失败、超时）
 ======== ==========================================================
@@ -45,7 +46,22 @@ ENVIRONMENT = "环境问题"    # 网络不通、服务没起
 # 服务端常见的错误码
 _CODE_NPE = "A00005"          # 服务端空指针 / 内部异常
 _CODE_PARAM = "A00014"        # 参数校验不通过
-_CODE_NO_PERMISSION = "A00001"  # 没有该操作的权限
+# ⚠️ A00001 在 mall4j 是**通用业务失败码**，不是专门的权限码：
+# 「该地区已存在」「该地区不存在」这些业务校验失败也报 A00001。
+# 所以不能光看 code 就判权限，必须结合 msg（见 classify_response_failure）。
+_CODE_NO_PERMISSION = "A00001"  # 通用业务失败码；msg 带权限语义时才是权限问题
+
+# msg 里出现这些词，说明是**数据状态**冲突（占位/重复/已删除的 id），
+# 多半是用例数据问题，而不是服务端缺陷。
+_DATA_STATE_HINTS = (
+    "已存在",
+    "不存在",
+    "重复",
+    "已被删除",
+    "未找到",
+    "not found",
+    "already exists",
+)
 
 
 @dataclass
@@ -168,8 +184,11 @@ def classify_response_failure(
         )
         return diag
 
-    if code == _CODE_NO_PERMISSION or "权限" in msg:
-        diag.category = "账号缺该接口的权限（服务端返回 A00001）"
+    # A00001 是通用业务失败码，只有 msg 明确在说权限时才判成权限问题。
+    # 以前光看 code == A00001 就判权限，把「该地区已存在」这类数据问题
+    # 也说成"去后台配权限"，会把修用例的人带偏。
+    if "权限" in msg or "无权" in msg or "未授权" in msg:
+        diag.category = f"账号缺该接口的权限（服务端返回 {code or 'A00001'}）"
         diag.hint = (
             "当前登录账号没有这个接口的权限标识。"
             "在后台「菜单/角色权限」里给这个账号配上对应权限，再重新登录跑；"
@@ -184,6 +203,21 @@ def classify_response_failure(
             "把 Excel 里这条用例的请求体字段补全（或改成先查再改的动态数据）再跑。"
         )
         diag.attribution = CASE_DATA
+        return diag
+
+    # 数据状态类失败（已存在/不存在/重复）——
+    # 典型成因是喂了文档占位值（如 areaId=0）、上一轮残留的重复记录，
+    # 或已被清理掉的 id。归到用例数据，让自愈流程能改用例；
+    # 数据核对无误仍报错，再按业务缺陷提给后端。
+    if success is False and any(kw in msg for kw in _DATA_STATE_HINTS):
+        diag.attribution = CASE_DATA
+        diag.category = f"数据状态冲突（{code or '无错误码'}）：{msg}"
+        diag.hint = (
+            "先核对用例喂的数据：id 是不是文档占位值（如 areaId=0）、"
+            "是不是上一轮残留的重复记录、或者已经被清理掉。"
+            "换成真实/唯一的 id、补上 setup 造数后重跑；"
+            "确认数据没问题仍报错，再按业务缺陷提给后端。"
+        )
         return diag
 
     if success is False:
@@ -242,6 +276,21 @@ def classify_exception(
         "这不是服务端的业务报错，是自动化脚本自己抛的异常"
         "（常见：变量取不到、请求体结构写错、断言类型不认识）。改脚本。"
     )
+
+    # 安全闸拦截不是"脚本写错了"，但也不是服务端的锅 ——
+    # 是用例盯上了真实数据（没造数据、也没把 id 加进白名单）。
+    # 单独归一类，免得提示里那句"改脚本"把人带偏。
+    from utils.infra.safety_guard import DangerousRequestBlocked
+
+    if isinstance(exc, DangerousRequestBlocked):
+        diag.attribution = CASE_DATA
+        diag.category = "安全闸拦截：危险写请求"
+        diag.hint = (
+            "这条请求会改动/删除真实数据，被 safety.dangerous_write 拦下了。"
+            "要用例先造自己的数据再删，或把目标 id 加进安全白名单；"
+            "确认是测试环境后再开 allow_dangerous / APITEST_ALLOW_DANGEROUS_DELETE。"
+        )
+        return diag
 
     if stage == "login":
         return _classify_login_failure(exc, diag)

@@ -13,11 +13,17 @@ from __future__ import annotations
 
 import pytest
 
+from framework.session_scope import targets_interface_tests
 from utils.logs.log_manager import log
 
 
 def pytest_configure(config: pytest.Config) -> None:
     """session 开始：初始化限流器。"""
+    if not targets_interface_tests(config):
+        # 单元测试不发接口请求，不需要限流；
+        # 而且限流器是全局单例，单测里被开启会串到同一进程的下一轮 run。
+        return
+
     from utils.config.config_manager import ConfigManager
     from utils.infra.rate_limiter import get_limiter, reset_limiter
 

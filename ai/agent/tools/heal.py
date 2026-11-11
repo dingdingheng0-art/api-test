@@ -33,6 +33,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai.agent.tools._params import safe_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
 
 #: 归因 → 允许的动作。**这是唯一的口径**，skill / 提示词都引用它
@@ -154,7 +155,10 @@ def _next_step(
             "交给用户，说明卡在哪 —— 不要继续改。"
         )
     if action == "rerun":
-        return f"run_cases(case_id='{case_no}') 重跑确认。不要动用例文件。"
+        return (
+            f"run_cases(case_id='{case_no}', run_draft=true) 重跑确认"
+            "（用例可能还是 draft，不加 run_draft 不会执行）。不要动用例文件。"
+        )
     if action == "file_defect":
         return (
             "整理请求/响应证据提缺陷给后端。确认是已知缺陷且短期修不了，"
@@ -195,25 +199,69 @@ def verify_heal(case_id: str, backup_dir: str = "", timeout: int = 600) -> dict[
     if not case_no:
         raise ToolError("必须给用例编号", hint="形如 API-168")
 
-    run = run_cases(case_id=case_no, timeout=timeout)
+    # ``run_draft=True`` 是必须的：自愈的对象常常还是 draft（刚生成的用例
+    # 默认就是 draft），默认状态过滤下 pytest 一条都不执行、退出码还是 0，
+    # 于是这里会误报「没有执行任何用例」—— 永远验证不了。
+    run = run_cases(case_id=case_no, timeout=timeout, run_draft=True)
     failed = [
         f for f in (run.get("failures") or []) if str(f.get("case") or "").strip()
     ]
-    passed = int((run.get("result") or {}).get("passed") or 0)
-    exit_code = int(run.get("exit_code") or 0)
+    result = run.get("result") or {}
+    passed = safe_int(result.get("passed"), 0)
+    skipped = safe_int(result.get("skipped"), 0)
+    total = safe_int(result.get("total"), 0)
+    exit_code = safe_int(run.get("exit_code"), 0)
+
+    # ⚠️ 「一条用例都没执行」不等于「修好了」。
+    #
+    # 用例编号写错 / 用例被改名 / 被状态过滤时，pytest 以前会把空参数化
+    # 当成一条 skipped 用例、退出码 0，这里就会 verified=True，
+    # 而实际上什么都没跑。现在框架对这种收集按「没有用例」退出（5），
+    # 这里再兜一层：result.json 说 total==skipped 时同样不判通过。
+    #
+    # 这种情况**不算失败轮次**，也不回滚 —— 没验证到不是改动的错。
+    # 注意只在 result.json 确实产出时判断：收集阶段就崩了（result 为空）
+    # 属于真的跑失败，要走下面的失败/回滚流程。
+    if result and total - skipped <= 0:
+        return ok(
+            case_id=case_no,
+            verified=False,
+            executed=0,
+            passed=passed,
+            run=run,
+            next_step=(
+                "本轮没有执行任何用例，不能判定修复是否有效。"
+                "先确认 case_id 是否正确、用例是否被调试状态过滤；"
+                "这次不算失败轮次，也不会回滚。"
+            ),
+        )
+
     success = exit_code == 0 and not failed
 
     if success:
         heal_state.reset(case_no)
+        # 这次通过有没有被记进「跑通过」账本，决定能不能直接转 debugged ——
+        # 报错说「已经记了」但实际没记，下一步 set_case_status 被拒就说不清了。
+        recorded = int(run.get("verified_recorded") or 0) > 0
+        if recorded:
+            step = (
+                "跑通了，这次通过已经记进「跑通过」账本（.cache/verify_ledger.json）。"
+                "用例本来就是 draft 的话，可以直接 set_case_status 改成 debugged；"
+                "别的状态不用动。"
+            )
+        else:
+            step = (
+                "跑通了，但这次没能记进「跑通过」账本（见 run.verify_hint）。"
+                "用例本来就是 draft 的话，先 run_cases(case_id=..., run_draft=true) "
+                "再跑一遍把账记上，再 set_case_status 改 debugged；"
+                "否则转正会被拒。"
+            )
         return ok(
             case_id=case_no,
             verified=True,
             failed_rounds=0,
             run=run,
-            next_step=(
-                "跑通了。用例本来就是 draft 的话，可以 set_case_status 改成 debugged。"
-                "别的状态不用动。"
-            ),
+            next_step=step,
         )
 
     rounds = heal_state.record_failed_round(

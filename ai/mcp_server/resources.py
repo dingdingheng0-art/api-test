@@ -24,6 +24,8 @@ URI 设计（``scheme://路径``，路径里不放中文和空格）::
 from __future__ import annotations
 
 import json
+import re
+from pathlib import Path
 from typing import Any
 
 from ai.mcp_server.protocol import RPCError, INVALID_PARAMS
@@ -31,6 +33,10 @@ from utils import paths
 from utils.logs.log_manager import log
 
 URI_PREFIX = "apitest://"
+
+#: 表结构快照的别名（``schema/{alias}``）。库里配的别名是标识符，
+#: 只允许字母数字下划线连字符 —— 它会被拼进文件名/glob，不能放开了收。
+_SAFE_ALIAS = re.compile(r"[A-Za-z0-9_-]{1,64}")
 
 # MIME 类型
 MIME_MARKDOWN = "text/markdown"
@@ -135,26 +141,60 @@ def _read(rest: str) -> tuple[str, str]:
 
     if rest.startswith("schema/"):
         alias = rest.split("/", 1)[1]
+        # ``alias`` 直接拼进 glob —— 不校验的话 ``apitest://schema/*``
+        # 会匹配到快照目录里的任意文件、``alias`` 里塞路径分隔符还能往外探。
+        # 别名本来就只能是标识符，直接按白名单挡掉。
+        if not _SAFE_ALIAS.fullmatch(alias):
+            raise RPCError(INVALID_PARAMS, f"表结构别名不合法: {alias!r}")
         schema_dir = paths.CACHE_DIR / "schema"
-        for path in schema_dir.glob(f"*{alias}.json"):
-            return _read_text(path, MIME_JSON), MIME_JSON
+        # 用精确文件名，别再拿用户输入做 glob 模式
+        for path in sorted(schema_dir.glob("*.json")):
+            if path.stem == alias or path.stem.endswith(f"_{alias}"):
+                return _read_text(path, MIME_JSON), MIME_JSON
         raise RPCError(INVALID_PARAMS, f"没有表结构快照: {alias}")
 
     if rest.startswith("cases/"):
         rel = rest.split("/", 1)[1]
         for root in _case_roots():
-            candidate = root / rel
-            if candidate.exists() and candidate.is_file():
+            candidate = _safe_case_path(root, rel)
+            if candidate is None:
+                continue
+            if candidate.is_file():
                 if candidate.suffix.lower() in (".xlsx", ".xlsm"):
                     # Excel 是二进制，转成解析后的 JSON 给客户端
                     from testcases.case_loader import load_cases_from_file
 
                     data = load_cases_from_file(candidate)
                     return json.dumps(data, ensure_ascii=False, indent=2), MIME_JSON
+                if candidate.suffix.lower() not in (".yaml", ".yml"):
+                    # 不让 resources 变成「任意文件读取接口」
+                    continue
                 return _read_text(candidate, MIME_YAML), MIME_YAML
         raise RPCError(INVALID_PARAMS, f"没有用例文件: {rel}")
 
     raise RPCError(INVALID_PARAMS, f"不认识的资源路径: {rest}")
+
+
+def _safe_case_path(root: Any, rel: str) -> Path | None:
+    """把 URI 里的相对路径解析到用例根目录内；越界返回 ``None``。
+
+    ``apitest://cases/../../configs/config.yaml`` 这种会被 ``root / rel``
+    拼成用例目录之外的路径 —— 不拦的话这就是一个任意文件读取接口。
+    先拒绝含 ``..`` 的路径，再解析后用 ``relative_to`` 复核一次。
+    """
+    text = str(rel or "").replace("\\", "/").strip()
+    if not text or text.startswith("/"):
+        return None
+    if any(part in ("..", ".") for part in text.split("/")):
+        return None
+
+    try:
+        base = Path(root).resolve()
+        candidate = (base / text).resolve()
+        candidate.relative_to(base)
+    except (OSError, ValueError):
+        return None
+    return candidate
 
 
 def _case_roots() -> list[Any]:

@@ -17,12 +17,16 @@ from __future__ import annotations
 import json
 from typing import Any
 
+from ai.agent.tools._params import clamp_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
 from utils import paths
-from utils.logs.log_manager import log
 
-# OpenAPI 快照缓存（文件不大，读一次就够了）
-_OPENAPI_CACHE: dict[str, Any] | None = None
+# OpenAPI 快照缓存：(mtime, 内容)
+#
+# ⚠️ 必须带 mtime。MCP 服务是长驻进程，如果只缓存内容、不认文件变化，
+# 重新同步接口文档之后智能体看到的还是上一份 —— 而且它会拿旧接口
+# 去写用例，报错还查不出原因。
+_OPENAPI_CACHE: tuple[float, dict[str, Any]] | None = None
 
 
 def _openapi_path() -> Any:
@@ -30,10 +34,8 @@ def _openapi_path() -> Any:
 
 
 def load_openapi() -> dict[str, Any]:
-    """读 OpenAPI 快照（缓存）。"""
+    """读 OpenAPI 快照（按文件修改时间缓存）。"""
     global _OPENAPI_CACHE
-    if _OPENAPI_CACHE is not None:
-        return _OPENAPI_CACHE
 
     path = _openapi_path()
     if not path.exists():
@@ -43,10 +45,28 @@ def load_openapi() -> dict[str, Any]:
         )
 
     try:
-        _OPENAPI_CACHE = json.loads(path.read_text(encoding="utf-8"))
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        raise ToolError(f"OpenAPI 快照读不了: {exc}") from exc
+
+    if _OPENAPI_CACHE is not None and _OPENAPI_CACHE[0] == mtime:
+        return _OPENAPI_CACHE[1]
+
+    try:
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         raise ToolError(f"OpenAPI 快照解析失败: {exc}") from exc
-    return _OPENAPI_CACHE
+
+    # 合法 JSON 不等于合法的接口文档：同步脚本写坏了会落成 ``[]`` / ``"..."``，
+    # 后面每个工具都 ``doc.get("paths")``，一抛 AttributeError 就是一整片工具报错。
+    if not isinstance(data, dict):
+        raise ToolError(
+            f"OpenAPI 快照结构不对（根节点是 {type(data).__name__}，应该是对象）: {path}",
+            hint="重新同步接口文档：python tools/maint/sync_api.py --project <项目> --url <v3/api-docs>",
+        )
+
+    _OPENAPI_CACHE = (mtime, data)
+    return data
 
 
 def _resolve_ref(doc: dict[str, Any], schema: Any, depth: int = 0) -> Any:
@@ -102,7 +122,11 @@ def _schema_fields(doc: dict[str, Any], schema: Any, limit: int = 40) -> list[di
 
 def _iter_operations(doc: dict[str, Any]):
     """遍历所有接口：``(path, method, operation)``。"""
-    for path, methods in (doc.get("paths") or {}).items():
+    paths = doc.get("paths") or {}
+    if not isinstance(paths, dict):
+        # 文档里 ``paths`` 写成列表也是合法 JSON，别在这里崩。
+        return
+    for path, methods in paths.items():
         if not isinstance(methods, dict):
             continue
         for method, op in methods.items():
@@ -116,7 +140,7 @@ def search_endpoints(query: str = "", tag: str = "", method: str = "", limit: in
     q = str(query or "").strip().lower()
     tag_q = str(tag or "").strip().lower()
     method_q = str(method or "").strip().upper()
-    limit = max(1, min(int(limit or 30), 100))
+    limit = clamp_int(limit, 30, 1, 100)
 
     matches: list[dict[str, Any]] = []
     for path, verb, op in _iter_operations(doc):

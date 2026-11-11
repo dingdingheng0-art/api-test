@@ -478,6 +478,21 @@ def collect_failures(
     return failures
 
 
+def _as_list(value: Any) -> list[Any]:
+    """把「应该是数组」的字段收敛成 list。
+
+    allure 结果文件是运行时产物，被写坏成对象/字符串都不稀奇；
+    直接迭代字符串会逐字符取、迭代对象会拿 key，后续 ``.get`` 必崩。
+    """
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
+
+
 def _collect_from_allure(results_dir: Path) -> list[FailureInfo]:
     """从 allure 结果文件里提取失败用例。"""
     failures: list[FailureInfo] = []
@@ -486,6 +501,8 @@ def _collect_from_allure(results_dir: Path) -> list[FailureInfo]:
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
             continue
+        if not isinstance(data, dict):
+            continue  # allure 结果被写坏成列表 / 标量，跳过这个文件
 
         status = data.get("status")
         if status not in ("failed", "broken"):
@@ -501,11 +518,18 @@ def _collect_from_allure(results_dir: Path) -> list[FailureInfo]:
         # 附件**两层都要看**：框架在用例失败时贴的「请求响应记录」「失败归因」
         # 挂在用例上（top-level attachments），而造数/查数步骤的响应体挂在
         # 各自的 step 上。只看 steps 会漏掉最关键的那几个。
-        for attachment in list(data.get("attachments") or []) + [
-            a
-            for step in data.get("steps") or []
-            for a in (step.get("attachments") or [])
-        ]:
+        attachments = [
+            item for item in _as_list(data.get("attachments")) if isinstance(item, dict)
+        ]
+        for step in _as_list(data.get("steps")):
+            if not isinstance(step, dict):
+                continue
+            attachments.extend(
+                item
+                for item in _as_list(step.get("attachments"))
+                if isinstance(item, dict)
+            )
+        for attachment in attachments:
             name_hint = str(attachment.get("name") or "")
             if "失败归因" in name_hint:
                 payload = _read_attachment(results_dir, attachment)
@@ -517,7 +541,9 @@ def _collect_from_allure(results_dir: Path) -> list[FailureInfo]:
             elif "校验证据" in name_hint:
                 evidence = _read_attachment(results_dir, attachment)
 
-        status_details = data.get("statusDetails") or {}
+        status_details = data.get("statusDetails")
+        if not isinstance(status_details, dict):
+            status_details = {}
         message = str(status_details.get("message") or "")
         traceback = str(status_details.get("trace") or "")
         error_type = _extract_error_type(traceback or message)
@@ -544,14 +570,27 @@ def _case_id_of(data: dict[str, Any]) -> str:
 
     框架把参数值写成 ``分页查询操作日志#API-183``（见
     ``framework/case_param.format_case_label``）—— ``#`` 后面就是编号。
+
+    ⚠️ 编号重名时 ``_unique_suffix`` 会在后面再补一个序号
+    （``分页查询操作日志#API-183#2``）。这种值不能直接取最后一段 ——
+    最后一段是序号 ``2``，拿它去查用例查不到。要往前再取一段。
     """
-    for param in data.get("parameters") or []:
+    for param in _as_list(data.get("parameters")):
+        if not isinstance(param, dict):
+            continue
         if str(param.get("name") or "") != "yaml_case":
             continue
         value = str(param.get("value") or "")
-        _, sep, tail = value.rpartition("#")
-        if sep and tail.strip():
-            return tail.strip()
+        parts = value.rsplit("#", 2)
+        if len(parts) < 2:
+            continue
+        tail = parts[-1].strip()
+        if not tail:
+            continue
+        # ``名称#API-183#2``：最后一段是去重序号，编号在它前面
+        if tail.isdigit() and len(parts) == 3 and parts[-2].strip():
+            return parts[-2].strip()
+        return tail
     return ""
 
 
@@ -593,6 +632,8 @@ def _collect_from_result_json(result_path: Path) -> list[FailureInfo]:
     try:
         data = json.loads(result_path.read_text(encoding="utf-8"))
     except (OSError, ValueError):
+        return []
+    if not isinstance(data, dict):
         return []
 
     failures: list[FailureInfo] = []

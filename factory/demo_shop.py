@@ -109,9 +109,7 @@ class ProductFactory(BaseProjectFactory):
         Returns:
             每条数据的字典（带 ``id``，清理时要用）
         """
-        from verify.db import DatabaseClient
-
-        db = DatabaseClient(self.options.get("db_config"))
+        db = self.db
         created: list[dict[str, Any]] = []
 
         for _ in range(count):

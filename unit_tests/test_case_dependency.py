@@ -501,3 +501,75 @@ def test_dependency_failed_upstream_is_reported(tmp_path: Path, monkeypatch) -> 
         _load(runner, ["上游"], resolver)
 
     assert "执行失败" in str(exc_info.value)
+
+
+# ---------------------------------------------------------------------------
+# 收集阶段的顺序重排（framework.pytest_plugin._sort_by_dependencies）
+# ---------------------------------------------------------------------------
+
+
+def _loaded(*cases: tuple[str, list[str] | None]):
+    """拼出 _sort_by_dependencies 需要的 ``[(项目, 文件, 用例数据)]``。"""
+    result = []
+    for name, deps in cases:
+        testcase: dict[str, Any] = {"name": name}
+        if deps:
+            testcase["depends_on"] = deps
+        result.append(("mall4j", Path(f"{name}.yaml"), {"testcase": testcase}))
+    return result
+
+
+def _names(items) -> list[str]:
+    return [str(data["testcase"]["name"]) for _p, _f, data in items]
+
+
+def test_sort_keeps_original_order_when_no_dependencies():
+    """一条依赖都没有时不能重排（同名用例以前会被挪走 9 个位置）。"""
+    from framework.pytest_plugin import _sort_by_dependencies
+
+    loaded = _loaded(
+        ("查询地区详情", None),
+        ("修改地区", None),
+        ("查询地区详情", None),
+        ("新增地区", None),
+    )
+
+    assert _sort_by_dependencies(loaded) is loaded
+
+
+def test_sort_pulls_dependency_before_dependent():
+    from framework.pytest_plugin import _sort_by_dependencies
+
+    loaded = _loaded(
+        ("U1", None),
+        ("B", None),
+        ("A", ["B"]),
+        ("U2", None),
+    )
+
+    assert _names(_sort_by_dependencies(loaded)) == ["U1", "B", "A", "U2"]
+
+
+def test_sort_puts_all_same_named_dependencies_first():
+    """依赖名对应用例有多条时，全部排在依赖方前面。"""
+    from framework.pytest_plugin import _sort_by_dependencies
+
+    loaded = _loaded(
+        ("A", ["B"]),
+        ("B", None),
+        ("B", None),
+    )
+
+    assert _names(_sort_by_dependencies(loaded)) == ["B", "B", "A"]
+
+
+def test_sort_keeps_chain_order():
+    from framework.pytest_plugin import _sort_by_dependencies
+
+    loaded = _loaded(
+        ("C", ["B"]),
+        ("B", ["A"]),
+        ("A", None),
+    )
+
+    assert _names(_sort_by_dependencies(loaded)) == ["A", "B", "C"]

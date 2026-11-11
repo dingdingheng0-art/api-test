@@ -353,6 +353,8 @@ def test_apply_writes_only_the_assert_cell(excel_file):
             {"type": "status_code", "expected": 200},
             {"type": "equal", "field": "success", "expected": True},
             {"type": "equal", "field": "code", "expected": "00000"},
+            {"type": "exists", "field": "data"},
+            {"type": "exists", "field": "data.records"},
         ],
         note="测试",
     )
@@ -362,6 +364,8 @@ def test_apply_writes_only_the_assert_cell(excel_file):
         {"check": "status_code", "comparator": "==", "expect": 200},
         {"check": "body", "jsonpath": "$.success", "comparator": "==", "expect": True},
         {"check": "body", "jsonpath": "$.code", "comparator": "==", "expect": "00000"},
+        {"check": "body", "jsonpath": "$.data", "comparator": "exists"},
+        {"check": "body", "jsonpath": "$.data.records", "comparator": "exists"},
     ]
 
 
@@ -370,6 +374,8 @@ def test_apply_is_idempotent_at_cell_level(excel_file):
     assertions = [
         {"type": "status_code", "expected": 200},
         {"type": "equal", "field": "success", "expected": True},
+        {"type": "exists", "field": "data"},
+        {"type": "exists", "field": "data.records"},
     ]
     case_io.apply_assertion_change("API-001", assertions)
     first = _cell(excel_file, 2, "断言")
@@ -384,6 +390,8 @@ def test_apply_creates_a_backup_with_manifest(excel_file, isolated_cache):
             {"type": "status_code", "expected": 200},
             {"type": "equal", "field": "success", "expected": True},
             {"type": "equal", "field": "code", "expected": "00000"},
+            {"type": "exists", "field": "data"},
+            {"type": "exists", "field": "data.records"},
         ],
         note="补断言",
     )
@@ -442,6 +450,8 @@ def test_apply_rejects_downgrading_comparator(excel_file):
             {"type": "status_code", "expected": 200},
             {"type": "equal", "field": "success", "expected": True},
             {"type": "equal", "field": "code", "expected": "00000"},
+            {"type": "exists", "field": "data"},
+            {"type": "exists", "field": "data.records"},
         ],
     )
     with pytest.raises(ToolError) as exc:
@@ -463,6 +473,8 @@ def test_apply_allows_weakening_when_explicitly_asked(excel_file, isolated_cache
         [
             {"type": "status_code", "expected": 200},
             {"type": "equal", "field": "success", "expected": True},
+            {"type": "exists", "field": "data"},
+            {"type": "exists", "field": "data.records"},
         ],
     )
     result = case_io.apply_assertion_change(
@@ -489,6 +501,7 @@ def test_strengthening_is_not_blocked(excel_file):
             {"type": "equal", "field": "success", "expected": True},
             {"type": "equal", "field": "code", "expected": "00000"},
             {"type": "exists", "field": "data"},
+            {"type": "exists", "field": "data.records"},
         ],
     )
     assert result["written"] is True
@@ -547,6 +560,19 @@ def test_status_change_rejects_unknown_status(excel_file):
         case_io.apply_status_change("API-001", "随便写的")
 
 
+#: 质量闸要求正例 ≥ 2 个业务断言。这些用例只验证落盘结构，不会真的执行。
+QUALITY_ASSERTS = [
+    {"type": "equal", "field": "success", "expected": True},
+    {"type": "exists", "field": "data"},
+    {"type": "exists", "field": "data.records"},
+]
+
+#: 写用例还要有清理，否则质量闸直接拒绝落盘。
+QUALITY_TEARDOWN = [
+    {"id": "清理", "operation_type": "api", "method": "DELETE", "path": "/admin/x"},
+]
+
+
 def test_create_case_appends_a_draft_row(excel_file):
     result = case_io.create_case(
         project="proj",
@@ -554,8 +580,9 @@ def test_create_case_appends_a_draft_row(excel_file):
         path="/admin/x",
         method="POST",
         title="新增数据（智能体）",
-        assertions=[{"type": "equal", "field": "success", "expected": True}],
+        assertions=QUALITY_ASSERTS,
         request_data={"name": "x"},
+        teardowns=QUALITY_TEARDOWN,
     )
     assert result["case_id"] == "API-003", "编号要接着现有的往下排"
     assert result["status"] == "draft", "新建的用例默认不进 CI"
@@ -564,6 +591,96 @@ def test_create_case_appends_a_draft_row(excel_file):
     assert _cell(excel_file, row, "请求方法") == "POST"
     assert _cell(excel_file, row, "用例状态") == "draft"
     assert json.loads(_cell(excel_file, row, "断言"))[0]["check"] == "body"
+
+
+def test_create_case_names_case_by_convention(excel_file):
+    """用例名称 = 模块显示名 - 业务动作（场景），不是 api_name - title。
+
+    和现役 132 条手工用例保持一致：``title`` 只写场景，业务名放 ``api_name``。
+    """
+    result = case_io.create_case(
+        project="proj",
+        module="mod",
+        path="/admin/x",
+        method="POST",
+        title="（正常请求）",
+        api_name="新增数据",
+        assertions=QUALITY_ASSERTS,
+        teardowns=QUALITY_TEARDOWN,
+    )
+    assert _cell(excel_file, result["row"], "用例名称") == "mod - 新增数据（正常请求）"
+    assert _cell(excel_file, result["row"], "接口名称") == "新增数据"
+    assert _cell(excel_file, result["row"], "用例标题") == "（正常请求）"
+
+
+def test_create_case_replaces_method_path_with_live_business_name(excel_file):
+    """模型把「接口名」抄成 ``GET /admin/x`` 时，用现役中文名替换。
+
+    报告里 ``GET /admin/x - GET /admin/x（正常请求）`` 完全看不出测什么；
+    现役用例里同一个接口叫「查数据」，就该用它。
+    """
+    result = case_io.create_case(
+        project="proj",
+        module="mod",
+        path="/admin/x",
+        method="GET",
+        title="GET /admin/x（正常请求）",
+        api_name="GET /admin/x",
+        assertions=QUALITY_ASSERTS,
+    )
+    assert _cell(excel_file, result["row"], "接口名称") == "查数据"
+    assert _cell(excel_file, result["row"], "用例标题") == "（正常请求）"
+    assert _cell(excel_file, result["row"], "用例名称") == "mod - 查数据（正常请求）"
+
+
+def test_create_case_rebuilds_case_name_that_carries_method_path(excel_file):
+    """调用方传了方法+路径拼的 case_name —— 作废重拼，不能原样落盘。"""
+    result = case_io.create_case(
+        project="proj",
+        module="mod",
+        path="/admin/x",
+        method="GET",
+        title="GET /admin/x（正常请求）",
+        api_name="GET /admin/x",
+        case_name="proj - GET /admin/x - GET /admin/x（正常请求）",
+        assertions=QUALITY_ASSERTS,
+    )
+    assert _cell(excel_file, result["row"], "用例名称") == "mod - 查数据（正常请求）"
+
+
+def test_create_case_does_not_borrow_name_across_methods(excel_file):
+    """同一路径不同方法不能借名字：``POST /admin/x`` 不是「查数据」。"""
+    result = case_io.create_case(
+        project="proj",
+        module="mod",
+        path="/admin/x",
+        method="POST",
+        title="（正常请求）",
+        api_name="POST /admin/x",
+        assertions=QUALITY_ASSERTS,
+        teardowns=QUALITY_TEARDOWN,
+    )
+    assert _cell(excel_file, result["row"], "接口名称") != "查数据"
+    assert _cell(excel_file, result["row"], "用例名称") == "mod - POST /admin/x（正常请求）"
+
+
+def test_norm_endpoint_matches_templates_and_concrete_ids():
+    """``/admin/area/{id}`` 和 ``/admin/area/1101`` 归一成同一个键。"""
+    assert case_io._norm_endpoint("/admin/area/{id}") == "/admin/area/{}"
+    assert case_io._norm_endpoint("/admin/area/1101") == "/admin/area/{}"
+    assert case_io._norm_endpoint("/admin/area/1101?x=1") == "/admin/area/{}"
+    assert case_io._norm_endpoint("/admin/area/") == "/admin/area"
+
+
+def test_align_case_naming_leaves_good_names_alone():
+    result = case_io.align_case_naming(
+        "proj", "mod", "/admin/x", "POST", "新增数据", "（正常请求）", "mod - 新增数据（正常请求）"
+    )
+    assert result == {
+        "api_name": "新增数据",
+        "title": "（正常请求）",
+        "case_name": "mod - 新增数据（正常请求）",
+    }
 
 
 def test_create_case_defaults_auth_header(excel_file):
@@ -578,6 +695,21 @@ def test_create_case_defaults_auth_header(excel_file):
     headers = json.loads(_cell(excel_file, result["row"], "请求头"))
     assert list(headers)[0].lower() in ("authorization", "accesstoken")
     assert "{{proj.token}}" in list(headers.values())[0]
+
+
+@pytest.mark.parametrize("status", ["debugged", "broken", "disabled"])
+def test_create_case_rejects_non_draft_status(excel_file, status):
+    """不能靠 new 的时候写 status 绕开「跑通过凭据」闸。"""
+    with pytest.raises(ToolError):
+        case_io.create_case(
+            project="proj",
+            module="mod",
+            path="/admin/x",
+            method="GET",
+            title="t",
+            assertions=[{"type": "status_code", "expected": 200}],
+            status=status,
+        )
 
 
 def test_create_case_rejects_bad_module_name(excel_file):
@@ -706,3 +838,147 @@ def test_yaml_status_change_keeps_comments(yaml_file):
     text = yaml_file.read_text(encoding="utf-8")
     assert text.startswith("# 这个文件里有注释")
     assert "\n  status: broken" in text, "缩进要保留（status 在 testcase 下面）"
+
+
+def _rewrite_yaml(yaml_file, text: str) -> None:
+    """换掉用例文件内容并清缓存（mtime 可能同秒，只靠 mtime 不保险）。"""
+    yaml_file.write_text(text, encoding="utf-8")
+    from ai.agent.tools._common import clear_cache
+
+    clear_cache()
+
+
+NESTED_STATUS_YAML = """\
+testcase:
+  name: 上架商品
+  steps:
+    - id: s1
+      method: POST
+      path: /admin/prod/status
+      data:
+        status: 1
+      assert:
+        - type: equal
+          field: success
+          expected: true
+"""
+
+FLAT_NESTED_STATUS_YAML = """\
+name: 上架商品
+steps:
+  - id: s1
+    method: POST
+    path: /admin/prod/status
+    data:
+      status: 1
+    assert:
+      - type: equal
+        field: success
+        expected: true
+"""
+
+
+def test_yaml_status_change_does_not_touch_nested_status(yaml_file):
+    """步骤请求体里的 ``status: 1`` 不是用例状态。
+
+    以前取「第一个匹配」，请求体排在前面时会把 ``data.status`` 改成
+    ``broken`` —— 文件还能解析、用例还在，返回「写成功」，用例本身仍是
+    draft，接口参数反被改坏。
+    """
+    _rewrite_yaml(yaml_file, NESTED_STATUS_YAML)
+
+    case_io.apply_status_change("上架商品", "broken")
+
+    import yaml
+
+    data = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+    assert data["testcase"]["status"] == "broken", "状态要写到用例本体上"
+    assert data["testcase"]["steps"][0]["data"]["status"] == 1, "请求体不能被改"
+
+
+def test_yaml_status_inserted_inside_testcase_wrapper(yaml_file):
+    """没有 status 键时要插在 ``testcase:`` 下面，不是文件开头。"""
+    _rewrite_yaml(yaml_file, NESTED_STATUS_YAML)
+
+    case_io.apply_status_change("上架商品", "disabled")
+
+    import yaml
+
+    data = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+    assert data["testcase"]["status"] == "disabled"
+    assert "status" not in {k for k in data if k != "testcase"}, "不能写成 testcase 的兄弟键"
+
+
+def test_flat_yaml_status_inserted_at_top_level(yaml_file):
+    """扁平用例（没有 ``testcase:`` 包装）要插在顶格。"""
+    _rewrite_yaml(yaml_file, FLAT_NESTED_STATUS_YAML)
+
+    case_io.apply_status_change("上架商品", "broken")
+
+    import yaml
+
+    data = yaml.safe_load(yaml_file.read_text(encoding="utf-8"))
+    assert data["status"] == "broken"
+    assert data["steps"][0]["data"]["status"] == 1, "请求体不能被改"
+
+
+FLAT_YAML_WITH_HEADER = """\
+# 扁平用例的注释头，改写时不能丢
+---
+name: 上架商品
+steps:
+  - id: s1
+    method: POST
+    path: /admin/prod/status
+"""
+
+
+def test_flat_yaml_status_inserted_after_document_header(yaml_file):
+    """``status`` 不能插到 ``---`` 前面 —— 那样会变成两份文档，
+    用例本体落到第二份，``safe_load`` 只读第一份（里面只有 status）。"""
+    _rewrite_yaml(yaml_file, FLAT_YAML_WITH_HEADER)
+
+    case_io.apply_status_change("上架商品", "broken")
+
+    import yaml
+
+    text = yaml_file.read_text(encoding="utf-8")
+    assert text.startswith("# 扁平用例的注释头"), "文件头注释不能丢"
+    data = yaml.safe_load(text)
+    assert data["status"] == "broken"
+    assert data["name"] == "上架商品", "用例本体要和 status 在同一份文档里"
+
+
+def test_replace_yaml_scalar_prefers_outermost_key():
+    """同一个键在多个缩进层级出现时，认最外层那个。"""
+    text = (
+        "testcase:\n"
+        "  steps:\n"
+        "    - data:\n"
+        "        status: 1\n"
+        "  status: draft\n"
+    )
+
+    out = case_io._replace_yaml_scalar(text, "status", "broken")
+
+    assert "        status: 1" in out, "内层不能被改"
+    assert "\n  status: broken\n" in out
+
+
+def test_verify_reports_status_that_did_not_land(yaml_file):
+    """复验要核对「文件里读出来的状态确实是它」—— 否则改到别处也会报成功。"""
+    errors = case_io._verify(yaml_file, "正向登录", expect_status="broken")
+
+    assert any("状态没写进去" in e for e in errors)
+
+
+def test_status_change_rolls_back_when_status_did_not_land(yaml_file, monkeypatch):
+    """写是写完了、但状态没落到用例本体上 → 必须回滚，不能报成功。"""
+    before = yaml_file.read_text(encoding="utf-8")
+    monkeypatch.setattr(case_io, "_replace_yaml_scalar", lambda text, key, value: text)
+
+    with pytest.raises(ToolError) as exc:
+        case_io.apply_status_change("正向登录", "broken")
+
+    assert "回滚" in str(exc.value)
+    assert yaml_file.read_text(encoding="utf-8") == before

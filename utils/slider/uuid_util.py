@@ -71,7 +71,9 @@ def fetch_uuid(timeout_ms: int = 60000, profile=None) -> str:
                 captured["uuid"] = req.headers.get("uuid", "")
 
         page.on("request", on_req)
-        page.goto(login_page, wait_until="networkidle", timeout=timeout_ms)
+        # ⚠️ 不用 networkidle —— 登录页有轮询/心跳请求，永远等不到，
+        #    每次都会卡满 timeout（见 browser_slider.open_login_page 的说明）。
+        page.goto(login_page, wait_until="domcontentloaded", timeout=timeout_ms)
         solver.fill_credentials(page, username, password)
         try:
             solver.open_slider(page)

@@ -28,7 +28,7 @@ from utils.config.config_util import get_config
 from utils.logs.log_manager import mask_text
 from utils.logs.logger_util import get_logger
 from utils.md5_util import md5
-from utils.config.project_profile import ProjectProfile, ProjectRegistry
+from utils.config.project_profile import ProjectProfile
 
 log = get_logger(__name__)
 

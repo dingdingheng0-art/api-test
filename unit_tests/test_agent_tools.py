@@ -291,6 +291,44 @@ def test_query_db_rejects_comment_prefixed_write(registry):
     assert result["ok"] is False
 
 
+@pytest.mark.parametrize(
+    "sql",
+    [
+        "SELECT * FROM tz_area INTO OUTFILE '/tmp/x.txt'",
+        "SELECT 1 INTO DUMPFILE '/tmp/x.bin'",
+        "select  1\n into   outfile '/tmp/x'",
+    ],
+)
+def test_query_db_rejects_select_into_outfile(registry, sql):
+    """``SELECT`` 开头不等于只读：``INTO OUTFILE`` 会写服务器文件。"""
+    result = registry.call("query_db", {"sql": sql})
+    assert result["ok"] is False
+    assert "OUTFILE" in result["error"]["message"] or "DUMPFILE" in result["error"]["message"]
+
+
+def test_query_db_rejects_non_list_params(registry):
+    result = registry.call(
+        "query_db", {"sql": "SELECT 1 WHERE 1 = %s", "params": "x"}
+    )
+    assert result["ok"] is False
+    assert "数组" in result["error"]["message"]
+
+
+@pytest.mark.parametrize(
+    "value,expected",
+    [
+        (None, None),
+        ([], None),
+        ([1], [1]),
+        ((1, 2), [1, 2]),
+    ],
+)
+def test_bind_params_normalizes(value, expected):
+    from ai.agent.tools.data import _bind_params
+
+    assert _bind_params(value) == expected
+
+
 def test_get_table_schema_by_keyword(registry):
     result = registry.call("get_table_schema", {"keyword": "area", "alias": "mall4j"})
     assert result["ok"] is True
@@ -412,6 +450,104 @@ def test_mcp_resource_read_unknown_uri():
         handle_request("resources/read", {"uri": "apitest://nope"})
 
 
+@pytest.mark.parametrize(
+    "rel",
+    ["../../configs/config.yaml", "..\\..\\configs\\config.yaml", "/etc/passwd", "", "."],
+)
+def test_resource_case_path_rejects_escapes(tmp_path, rel):
+    """``apitest://cases/../../configs/config.yaml`` 不能读到用例目录外。"""
+    from ai.mcp_server.resources import _safe_case_path
+
+    assert _safe_case_path(tmp_path, rel) is None
+
+
+def test_resource_case_path_accepts_file_inside_root(tmp_path):
+    from ai.mcp_server.resources import _safe_case_path
+
+    target = tmp_path / "mall4j" / "admin_area" / "a.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("x", encoding="utf-8")
+
+    assert _safe_case_path(tmp_path, "mall4j/admin_area/a.yaml") == target.resolve()
+
+
+def test_resource_read_case_traversal_is_rejected():
+    from ai.mcp_server.protocol import RPCError
+    from ai.mcp_server.server import handle_request
+
+    with pytest.raises(RPCError):
+        handle_request(
+            "resources/read", {"uri": "apitest://cases/../../configs/config.yaml"}
+        )
+
+
+def test_resource_reads_case_yaml_inside_root(tmp_path, monkeypatch):
+    from ai.mcp_server import resources
+
+    target = tmp_path / "mall4j" / "admin_area" / "a.yaml"
+    target.parent.mkdir(parents=True)
+    target.write_text("testcase:\n  name: x\n", encoding="utf-8")
+    monkeypatch.setattr(resources, "_case_roots", lambda: [tmp_path])
+
+    out = resources.read_resource("apitest://cases/mall4j/admin_area/a.yaml")
+
+    assert "name: x" in out["contents"][0]["text"]
+
+
+def test_resource_case_read_rejects_non_case_suffix(tmp_path, monkeypatch):
+    """resources 不是任意文件读取接口 —— 非用例后缀一律拒绝。"""
+    from ai.mcp_server import resources
+    from ai.mcp_server.protocol import RPCError
+
+    (tmp_path / "secret.txt").write_text("token=abc", encoding="utf-8")
+    monkeypatch.setattr(resources, "_case_roots", lambda: [tmp_path])
+
+    with pytest.raises(RPCError):
+        resources.read_resource("apitest://cases/secret.txt")
+
+
+@pytest.mark.parametrize("alias", ["*", "?", "a?b", "a*", "a/b", "../x", "", "a" * 65])
+def test_resource_schema_alias_rejects_wildcards(alias, tmp_path, monkeypatch):
+    """``alias`` 会被拼进 glob —— ``apitest://schema/*`` 能匹配快照目录里的任意文件。"""
+    from ai.mcp_server import resources
+    from ai.mcp_server.protocol import RPCError
+
+    monkeypatch.setattr(resources.paths, "CACHE_DIR", tmp_path)
+    with pytest.raises(RPCError):
+        resources.read_resource(f"apitest://schema/{alias}")
+
+
+def test_resource_schema_alias_reads_matching_snapshot(tmp_path, monkeypatch):
+    """``list_resources`` 给出的别名要能读回来（文件名是 ``<前缀>_<别名>.json``）。"""
+    from ai.mcp_server import resources
+
+    schema_dir = tmp_path / "schema"
+    schema_dir.mkdir()
+    (schema_dir / "mysql_yami_shops.json").write_text(
+        json.dumps({"tables": [{"name": "tz_area"}]}), encoding="utf-8"
+    )
+    monkeypatch.setattr(resources.paths, "CACHE_DIR", tmp_path)
+
+    out = resources.read_resource("apitest://schema/yami_shops")
+
+    assert "tz_area" in out["contents"][0]["text"]
+    assert out["contents"][0]["mimeType"] == "application/json"
+
+
+def test_resource_schema_alias_does_not_expand_wildcard(tmp_path, monkeypatch):
+    """``schema/*`` 被当成合法名的话会把快照目录里的第一个文件交出去。"""
+    from ai.mcp_server import resources
+    from ai.mcp_server.protocol import RPCError
+
+    schema_dir = tmp_path / "schema"
+    schema_dir.mkdir()
+    (schema_dir / "mysql_x.json").write_text("{}", encoding="utf-8")
+    monkeypatch.setattr(resources.paths, "CACHE_DIR", tmp_path)
+
+    with pytest.raises(RPCError):
+        resources.read_resource("apitest://schema/*")
+
+
 def test_mcp_prompts_list_and_get():
     from ai.mcp_server.protocol import RPCError
     from ai.mcp_server.server import handle_request
@@ -441,6 +577,29 @@ def test_mcp_prompts_list_and_get():
 # --------------------------------------------------------------------------
 # 端到端：真的走一遍 stdio 循环
 # --------------------------------------------------------------------------
+
+
+@pytest.mark.parametrize("line", ["[]", "[1, 2]", '"hi"', "5", "true", "null"])
+def test_stdio_loop_survives_non_object_message(line):
+    """非对象 JSON 要在入口挡掉 —— 主循环对它取 ``.get`` 会 AttributeError，
+    那句在 try 之外，整个 stdio 服务直接退出。"""
+    import io
+
+    from ai.mcp_server.server import serve
+
+    stdin = io.StringIO(
+        line + "\n" + json.dumps({"jsonrpc": "2.0", "id": 1, "method": "ping"}) + "\n"
+    )
+    stdout = io.StringIO()
+
+    assert serve(stdin, stdout) == 0, "坏消息不能让服务退出"
+
+    responses = [
+        json.loads(row) for row in stdout.getvalue().splitlines() if row.strip()
+    ]
+    assert len(responses) == 2
+    assert responses[0]["error"]["code"] == -32600
+    assert responses[1]["result"] == {}, "后面那条正常请求要照常处理"
 
 
 def test_stdio_loop_end_to_end():

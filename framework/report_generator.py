@@ -258,7 +258,7 @@ def merge_worker_results() -> int:
     不合并的话 allure 只看得到一个 worker 的结果，报告会缺一大半。
 
     Returns:
-        合并了多少个结果文件
+        合并了多少个文件（结果、容器、附件都算）
     """
     if not ALLURE_RESULTS.exists():
         return 0
@@ -273,18 +273,33 @@ def merge_worker_results() -> int:
 
     merged = 0
     for worker_dir in worker_dirs:
+        # ⚠️ 必须把 worker 目录里的**所有文件**都搬过来，不能只搬 .json。
+        # allure 的附件（请求响应、异常堆栈、图片……）是单独的文件，
+        # result.json 里按文件名引用它们。只合并 json、然后把 worker
+        # 目录删掉，报告里所有附件都会变成"附件缺失"。
         for item in worker_dir.iterdir():
-            if item.name.endswith(".json") and item.is_file():
-                target = ALLURE_RESULTS / item.name
-                try:
-                    # 同名文件加后缀，避免互相覆盖
-                    if target.exists():
-                        stem, _, suffix = item.name.rpartition(".")
-                        target = ALLURE_RESULTS / f"{stem}-{worker_dir.name}.{suffix}"
-                    shutil.copy2(item, target)
-                    merged += 1
-                except OSError as exc:
-                    log.warning("合并 allure 结果失败 %s: %s", item.name, exc)
+            if not item.is_file():
+                continue
+            target = ALLURE_RESULTS / item.name
+            try:
+                if target.exists():
+                    renamed = _result_file_name_on_collision(
+                        item.name, worker_dir.name
+                    )
+                    if renamed is None:
+                        # 附件是按文件名被 result.json 引用的，改名会让
+                        # 引用悬空。附件名是 UUID，重名基本只可能是同一份
+                        # 内容，跳过即可（保留主目录里的那份）。
+                        log.warning(
+                            "合并 allure 结果：同名附件 %s 已存在，跳过（%s）",
+                            item.name, worker_dir.name,
+                        )
+                        continue
+                    target = ALLURE_RESULTS / renamed
+                shutil.copy2(item, target)
+                merged += 1
+            except OSError as exc:
+                log.warning("合并 allure 结果失败 %s: %s", item.name, exc)
 
         # 合并完删掉 worker 子目录（避免下次误当结果）
         try:
@@ -295,6 +310,23 @@ def merge_worker_results() -> int:
     if merged:
         log.info("已合并 %s 个 worker 的 allure 结果（%s）", merged, len(worker_dirs))
     return merged
+
+
+def _result_file_name_on_collision(name: str, worker: str) -> str | None:
+    """重名时给结果/容器文件换一个 allure 还认得出来的名字。
+
+    allure2 是**按文件名后缀**识别文件的：``*-result.json`` 才是用例结果，
+    ``*-container.json`` 才是容器。所以 worker 名必须插在 ``-result`` /
+    ``-container`` **前面**，拼到 ``.json`` 前面会变成
+    ``xxx-result-worker-gw0.json`` —— allure 直接忽略，合并完用例反而没了。
+
+    附件（``*-attachment.*``）是按文件名被 result.json 引用的，不能改名，
+    返回 ``None`` 表示跳过。
+    """
+    for suffix in ("-result.json", "-container.json"):
+        if name.endswith(suffix):
+            return f"{name[: -len(suffix)]}-{worker}{suffix}"
+    return None
 
 
 def _allure_cli_version(allure_bin: str) -> tuple[int, ...]:
@@ -441,6 +473,9 @@ def generate_allure_report(env: str = "online", open_browser: bool = True) -> Pa
 
     log.info("allure 报告已生成: %s", index)
 
+    # 只留最近 N 份，别让 reports/ 无限长大
+    prune_old_reports()
+
     # 固定一个"最新报告"的入口，方便直接打开
     # 注意：这里存的是相对路径，用 file:// 打开会空白，
     # 所以真正看报告要走 HTTP（见下面 _open_via_http）
@@ -464,6 +499,54 @@ def generate_allure_report(env: str = "online", open_browser: bool = True) -> Pa
         _open_via_http(output_dir)
 
     return index
+
+
+def prune_old_reports(keep: int | None = None) -> int:
+    """只保留最近 ``keep`` 份 allure 报告目录，删掉更老的。
+
+    以前每跑一次就多一个 ``reports/allure_<时间戳>/``，从不清理 ——
+    跑上一个月，``reports/`` 能堆到几个 G（allure 报告里带完整附件）。
+
+    默认保留 10 份，可用环境变量 ``APITEST_REPORT_KEEP`` 调整；
+    ``keep <= 0`` 表示不清理。
+
+    Returns:
+        删掉的目录数
+    """
+    if keep is None:
+        try:
+            keep = int(os.environ.get("APITEST_REPORT_KEEP", "10"))
+        except ValueError:
+            keep = 10
+
+    if keep <= 0 or not REPORTS_ROOT.exists():
+        return 0
+
+    def _stamp_of(path: Path) -> str:
+        return path.name[len("allure_"):]
+
+    # 目录名是 allure_<YYYYmmdd_HHMMSS>，按名字倒序就是按时间倒序
+    reports = sorted(
+        (
+            p
+            for p in REPORTS_ROOT.glob("allure_*")
+            if p.is_dir() and _stamp_of(p)[:8].isdigit()
+        ),
+        key=_stamp_of,
+        reverse=True,
+    )
+
+    removed = 0
+    for old in reports[keep:]:
+        try:
+            shutil.rmtree(old, ignore_errors=True)
+            removed += 1
+        except OSError as exc:  # noqa: BLE001 - 删不掉就留着，不影响本次报告
+            log.warning("清理旧报告失败 %s: %s", old.name, exc)
+
+    if removed:
+        log.info("已清理 %s 份旧 allure 报告（保留最近 %s 份）", removed, keep)
+    return removed
 
 
 def _open_via_http(report_dir: Path) -> bool:
@@ -509,29 +592,3 @@ def open_in_browser(path: Path) -> bool:
     except Exception as exc:  # noqa: BLE001
         log.warning("自动打开浏览器失败: %s", exc)
         return False
-
-
-def generate_html_report(env: str = "online") -> Path | None:
-    """用 pytest-html 生成 HTML 报告（由 pytest --html 调用，这里只算路径）。"""
-    stamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
-    output = REPORTS_ROOT / f"report_{stamp}.html"
-    log.info("HTML 报告: %s", output)
-    return output
-
-
-def write_result_json(results: dict) -> Path:
-    """把执行结果写成 JSON（给 CI 采集用）。"""
-    REPORTS_ROOT.mkdir(parents=True, exist_ok=True)
-    out = REPORTS_ROOT / "result.json"
-    out.write_text(json.dumps(results, ensure_ascii=False, indent=2), encoding="utf-8")
-    return out
-
-
-def generate_report(report_type: str = "allure", env: str = "online") -> Path | None:
-    """按类型生成报告。"""
-    if report_type == "allure":
-        return generate_allure_report(env)
-    if report_type == "html":
-        return generate_html_report(env)
-    return None

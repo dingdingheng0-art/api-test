@@ -20,7 +20,8 @@
 | `curl_parser.py` | cURL 命令解析 | 被 dispatcher 调用 |
 | `case_builder.py` | 接口列表 → 用例结构 / 写 YAML / 导出 Excel | 被 cli 调用 |
 | `web.py` | 本地网页上传页（拖文件 → 预览 → 一键生成） | `python -m tools.importer.cli web` |
-| `test_importer.py` | 导入器的单测 | `python -m pytest tools/importer/test_importer.py` |
+
+导入器的单测在 `unit_tests/test_importer.py`：`python -m pytest unit_tests/test_importer.py`。
 
 示例文档在 `data/importer_demo/`。
 

@@ -7,11 +7,11 @@
 # ============================================================================
 
 # ============ 被测系统配置 ============
-base_url: "http://103.236.97.137:8190/_admin"
+base_url: "http://103.236.97.77:8190/_admin"
 
 # 前端管理后台（Origin/Referer 固定值，必须与抓包一致）
-origin: "http://103.236.97.137:8190"
-referer: "http://103.236.97.137:8190/"
+origin: "http://103.236.97.77:8190"
+referer: "http://103.236.97.77:8190/"
 
 # 浏览器 UA
 user_agent: >-
@@ -112,7 +112,7 @@ db:
   # 用例断言里写 alias: mall4j 就走这套；不写 alias 走上面的 default。
   #
   # 连接信息全部走 .env（这个文件要进 git，不能写死账号密码）：
-  #   MALL4J_DB_HOST=103.236.97.137
+  #   MALL4J_DB_HOST=103.236.97.77
   #   MALL4J_DB_PORT=3306
   #   MALL4J_DB_USER=...
   #   MALL4J_DB_PASSWORD=...
@@ -299,11 +299,11 @@ projects:
   # 所以老配置只写 host 也能照常跑。
   mall4j:
     online:
-      host: "http://103.236.97.137:8190/_admin"
+      host: "http://103.236.97.77:8190/_admin"
       is_need_login: True
       label: "mall4j 管理后台"
-      web_url: "http://103.236.97.137:8190"
-      login_page: "http://103.236.97.137:8190/login"
+      web_url: "http://103.236.97.77:8190"
+      login_page: "http://103.236.97.77:8190/login"
       auth:
         token_header: "Authorization"   # 业务接口的鉴权头
         session_header: null            # 没有额外的会话标识头
@@ -320,11 +320,11 @@ projects:
           password: "${MALL4J_PASSWORD:}"
 
     pre:
-      host: "${MALL4J_PRE_HOST:http://103.236.97.137:8190/_admin}"
+      host: "${MALL4J_PRE_HOST:http://103.236.97.77:8190/_admin}"
       is_need_login: True
       label: "mall4j 管理后台（预发）"
-      web_url: "${MALL4J_PRE_WEB_URL:http://103.236.97.137:8190}"
-      login_page: "${MALL4J_PRE_WEB_URL:http://103.236.97.137:8190}/login"
+      web_url: "${MALL4J_PRE_WEB_URL:http://103.236.97.77:8190}"
+      login_page: "${MALL4J_PRE_WEB_URL:http://103.236.97.77:8190}/login"
       auth:
         token_header: "Authorization"
         session_header: null
@@ -339,11 +339,11 @@ projects:
 
     # 本地/测试环境 —— 默认环境指的就是这个
     test:
-      host: "${MALL4J_TEST_HOST:http://103.236.97.137:8190/_admin}"
+      host: "${MALL4J_TEST_HOST:http://103.236.97.77:8190/_admin}"
       is_need_login: True
       label: "mall4j 管理后台（测试环境）"
-      web_url: "${MALL4J_TEST_WEB_URL:http://103.236.97.137:8190}"
-      login_page: "${MALL4J_TEST_WEB_URL:http://103.236.97.137:8190}/login"
+      web_url: "${MALL4J_TEST_WEB_URL:http://103.236.97.77:8190}"
+      login_page: "${MALL4J_TEST_WEB_URL:http://103.236.97.77:8190}/login"
       auth:
         token_header: "Authorization"
         session_header: null

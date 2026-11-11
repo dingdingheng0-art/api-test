@@ -23,6 +23,7 @@ import json
 import re
 from typing import Any
 
+from ai.agent.tools._params import clamp_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
 from utils import paths
 from utils.logs.log_manager import log
@@ -33,8 +34,22 @@ _READONLY_VERBS = ("select", "show", "describe", "desc", "explain")
 # 单次查询最多返回多少行（防止一条 SELECT * 把上下文撑爆）
 MAX_ROWS = 200
 
-# 表结构快照缓存
-_SCHEMA_CACHE: dict[str, Any] = {}
+# 表结构快照缓存：{路径: (mtime, 内容)}
+#
+# 带 mtime 的原因同 ``endpoints._OPENAPI_CACHE`` —— 长驻进程里重新
+# dump 过表结构之后，不能还拿旧快照回答"这个字段是什么类型"。
+_SCHEMA_CACHE: dict[str, tuple[float, dict[str, Any]]] = {}
+
+
+def _as_list(value: Any) -> list[Any]:
+    """把「应该是数组」的字段收敛成 list（快照是外部工具写的）。"""
+    if isinstance(value, list):
+        return value
+    if isinstance(value, tuple):
+        return list(value)
+    if isinstance(value, dict):
+        return [value]
+    return []
 
 
 def _schema_files() -> list[Any]:
@@ -46,14 +61,26 @@ def _schema_files() -> list[Any]:
 
 def _load_schema_file(path: Any) -> dict[str, Any]:
     key = str(path)
-    if key in _SCHEMA_CACHE:
-        return _SCHEMA_CACHE[key]
+    try:
+        mtime = path.stat().st_mtime
+    except OSError as exc:
+        log.warning("表结构快照读不了 %s: %s", path, exc)
+        return {}
+
+    cached = _SCHEMA_CACHE.get(key)
+    if cached is not None and cached[0] == mtime:
+        return cached[1]
+
     try:
         data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         log.warning("表结构快照读不了 %s: %s", path, exc)
         data = {}
-    _SCHEMA_CACHE[key] = data
+    if not isinstance(data, dict):
+        # 被写坏成 ``[]`` / ``"..."`` 的快照当没有；否则查表结构的工具会到处 ``.get`` 崩。
+        log.warning("表结构快照结构不对（%s）: %s", type(data).__name__, path)
+        data = {}
+    _SCHEMA_CACHE[key] = (mtime, data)
     return data
 
 
@@ -72,7 +99,12 @@ def _leading_verb(sql: str) -> str:
     return cleaned.split()[0].lower().strip("(")
 
 
-def query_db(sql: str, alias: str = "mall4j", limit: int = 50) -> dict[str, Any]:
+def query_db(
+    sql: str,
+    alias: str = "mall4j",
+    limit: int = 50,
+    params: Any = None,
+) -> dict[str, Any]:
     """执行只读 SQL。"""
     if not sql or not sql.strip():
         raise ToolError("SQL 为空", hint="传一条 SELECT 语句")
@@ -87,12 +119,23 @@ def query_db(sql: str, alias: str = "mall4j", limit: int = 50) -> dict[str, Any]
             ),
         )
 
+    # ``SELECT`` 也能往磁盘写文件：``SELECT ... INTO OUTFILE '/path'``。
+    # 第一个关键字是 SELECT，白名单拦不住 —— 单独按子句挡。
+    squashed = re.sub(r"\s+", " ", _first_statement(sql).lower())
+    for clause in ("into outfile", "into dumpfile"):
+        if clause in squashed:
+            raise ToolError(
+                f"拒绝执行：{clause.upper()} 会把查询结果写到服务器本地文件",
+                hint="这个工具只做只读查询，不负责导出文件。",
+            )
+
     # 多语句注入：分号后面还有内容就拒绝
     statements = [s for s in _first_statement(sql).split(";") if s.strip()]
     if len(statements) > 1:
         raise ToolError("拒绝执行：一次只能跑一条语句")
 
-    limit = max(1, min(int(limit or 50), MAX_ROWS))
+    limit = clamp_int(limit, 50, 1, MAX_ROWS)
+    bind = _bind_params(params)
 
     from utils.config.config_manager import ConfigManager
     from verify.db import DatabaseClient
@@ -106,7 +149,7 @@ def query_db(sql: str, alias: str = "mall4j", limit: int = 50) -> dict[str, Any]
 
     client = DatabaseClient(config)
     try:
-        rows = client.query(sql)
+        rows = client.query(sql, bind)
     except Exception as exc:  # noqa: BLE001
         raise ToolError(f"查询失败: {exc}", hint="先用 get_table_schema 确认表名/列名") from exc
     finally:
@@ -125,6 +168,23 @@ def query_db(sql: str, alias: str = "mall4j", limit: int = 50) -> dict[str, Any]
     )
 
 
+def _bind_params(params: Any) -> list[Any] | None:
+    """把工具入参归一成位置参数列表。
+
+    以前 ``query_db`` 只收 SQL、不收参数，但工具描述写着"用 ``%s`` 占位" ——
+    模型照着写 ``WHERE area_id = %s`` 就必然报错（占位符没有值）。
+    现在参数真的能传下去了，方括号里按位置绑定。
+    """
+    if params is None:
+        return None
+    if isinstance(params, (list, tuple)):
+        return list(params) or None
+    raise ToolError(
+        "params 必须是数组（按 %s 的顺序）",
+        hint="例如 sql='SELECT ... WHERE area_id = %s', params=[110000]",
+    )
+
+
 def get_table_schema(table: str = "", keyword: str = "", alias: str = "mall4j") -> dict[str, Any]:
     """查表结构（读本地快照，不连库）。"""
     files = _schema_files()
@@ -138,12 +198,19 @@ def get_table_schema(table: str = "", keyword: str = "", alias: str = "mall4j") 
     picked = next((f for f in files if alias in f.stem), files[0])
     data = _load_schema_file(picked)
     tables = data.get("tables") or []
+    if not isinstance(tables, list):
+        raise ToolError(
+            f"表结构快照的 tables 不是列表: {picked}",
+            hint="重新导出快照：python tools/maint/dump_schema.py --alias <alias> --format json",
+        )
+    tables = [item for item in tables if isinstance(item, dict)]
     if not tables:
         raise ToolError(f"快照里没有表: {picked}")
 
     if table:
         for item in tables:
             if item.get("name") == table:
+                columns = [c for c in _as_list(item.get("columns")) if isinstance(c, dict)]
                 return ok(
                     source=picked.name,
                     table=item.get("name"),
@@ -158,7 +225,7 @@ def get_table_schema(table: str = "", keyword: str = "", alias: str = "mall4j") 
                             "auto_increment": c.get("auto_increment"),
                             "comment": c.get("comment") or "",
                         }
-                        for c in item.get("columns") or []
+                        for c in columns
                     ],
                 )
         raise ToolError(
@@ -171,7 +238,7 @@ def get_table_schema(table: str = "", keyword: str = "", alias: str = "mall4j") 
         {
             "name": t.get("name"),
             "comment": t.get("comment") or "",
-            "columns": len(t.get("columns") or []),
+            "columns": len(_as_list(t.get("columns"))),
             "approx_rows": t.get("approx_rows"),
         }
         for t in tables
@@ -208,6 +275,12 @@ TOOLS = [
                     "type": "integer",
                     "description": "最多返回行数（默认 50，上限 200）",
                     "default": 50,
+                },
+                "params": {
+                    "type": "array",
+                    "items": {},
+                    "description": "SQL 里 %s 占位符的位置参数，按顺序绑定（强烈建议用它，别拼字符串）",
+                    "default": [],
                 },
             },
             "required": ["sql"],

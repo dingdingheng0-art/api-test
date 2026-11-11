@@ -168,10 +168,14 @@ def _load_openapi() -> dict[str, Any]:
         log.warning("没有 OpenAPI 快照，接口部分跳过：%s", path)
         return {}
     try:
-        return json.loads(path.read_text(encoding="utf-8"))
+        data = json.loads(path.read_text(encoding="utf-8"))
     except (OSError, ValueError) as exc:
         log.warning("OpenAPI 快照读不了: %s", exc)
         return {}
+    if not isinstance(data, dict):
+        log.warning("OpenAPI 快照结构不对（%s），接口部分跳过：%s", type(data).__name__, path)
+        return {}
+    return data
 
 
 def _load_tables() -> dict[str, dict[str, Any]]:
@@ -190,10 +194,25 @@ def _load_tables() -> dict[str, dict[str, Any]]:
         except (OSError, ValueError) as exc:
             log.warning("表结构快照读不了 %s: %s", path.name, exc)
             continue
+        if not isinstance(data, dict):
+            log.warning("表结构快照结构不对（%s），跳过 %s", type(data).__name__, path.name)
+            continue
         for table in data.get("tables") or []:
+            if not isinstance(table, dict):
+                continue  # tables 里混进字符串也别炸
             name = str(table.get("name") or "")
-            if name:
-                out[name] = table
+            if not name:
+                continue
+            # 快照是外部工具写的：``columns`` 可能是对象/字符串，元素里也可能
+            # 混进字符串。下游到处 ``col.get``，在这里一次收敛干净。
+            columns = table.get("columns")
+            if not isinstance(columns, list):
+                columns = []
+            table = {
+                **table,
+                "columns": [col for col in columns if isinstance(col, dict)],
+            }
+            out[name] = table
     return out
 
 

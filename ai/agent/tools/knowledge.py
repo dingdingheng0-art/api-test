@@ -21,21 +21,48 @@
 
 from __future__ import annotations
 
+import time
 from typing import Any
 
+from ai.agent.tools._params import clamp_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
-from utils.logs.log_manager import log
+
+# 过期检查的缓存：(built_at, 检查时刻, 结论)
+#
+# 每次知识工具调用都扫一遍用例目录 + 所有用例文件的 mtime ——
+# 智能体一轮对话里能连着问十几次，扫描完全重复。
+# 建图时间没变、且距离上次检查不到 5 秒，直接复用结论。
+# 5 秒足够挡掉一轮里的重复调用，又不至于让"刚改完文件"很久看不出过期。
+_STALE_TTL_SECONDS = 5.0
+_stale_cache: tuple[Any, float, str] | None = None
 
 
 def _stale_reason() -> str:
     """图谱是不是比源文件旧。返回空串表示不过期。"""
     from ai.knowledge.store import get_store
-    from utils import paths
 
     store = get_store()
     built_at = store.get_meta("built_at")
     if not built_at:
         return "图谱还没建过"
+
+    global _stale_cache
+    now = time.time()
+    if (
+        _stale_cache is not None
+        and _stale_cache[0] == built_at
+        and now - _stale_cache[1] < _STALE_TTL_SECONDS
+    ):
+        return _stale_cache[2]
+
+    reason = _scan_stale_sources(built_at)
+    _stale_cache = (built_at, now, reason)
+    return reason
+
+
+def _scan_stale_sources(built_at: Any) -> str:
+    """真正去扫源文件（结果见 :func:`_stale_reason` 的缓存）。"""
+    from utils import paths
 
     newest = 0.0
     sources = [
@@ -107,7 +134,9 @@ def search_knowledge(query: str, kind: str = "", limit: int = 10) -> dict[str, A
     if not query:
         raise ToolError("必须给查询词", hint="字段名 / 接口路径 / 表名 / 用例名都行")
 
-    kinds = tuple(k.strip() for k in kind.split(",") if k.strip()) if kind else ()
+    kind_text = str(kind or "")
+    kinds = tuple(k.strip() for k in kind_text.split(",") if k.strip()) if kind_text else ()
+    limit = clamp_int(limit, 10, 1, 100)
     store = _ensure_graph()
     hits = Retriever(store).recall(query, kinds=kinds, limit=limit)
 

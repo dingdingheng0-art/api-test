@@ -20,7 +20,7 @@ _ROOT = Path(__file__).resolve().parent.parent
 if str(_ROOT) not in sys.path:
     sys.path.insert(0, str(_ROOT))
 
-from utils.paths import CASES_ROOT, PROJECT_ROOT  # noqa: E402
+from utils.paths import CASES_ROOT  # noqa: E402
 MODULE_HEADERS = ["模块名", "模块标签", "模块说明", "执行顺序", "标签(多选)"]
 API_HEADERS = [
     "接口名", "接口路径", "请求方法", "接口描述",

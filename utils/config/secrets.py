@@ -43,8 +43,8 @@ from typing import Any
 
 from utils.logs.log_manager import log
 
-# 项目根
-PROJECT_ROOT = Path(__file__).resolve().parents[2]
+# 项目根（全项目只用这一处定义）
+from utils.paths import PROJECT_ROOT
 
 # 本地 .env 文件（不进 git）
 ENV_FILE = PROJECT_ROOT / ".env"

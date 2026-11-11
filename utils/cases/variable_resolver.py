@@ -54,26 +54,37 @@ class VariableResolver:
 
     # ---------------- 对外入口 ----------------
 
-    def process_data(self, data: Any) -> Any:
-        """递归处理 dict / list / str 里的 ``{{ }}``。"""
+    def process_data(self, data: Any, missing: list[str] | None = None) -> Any:
+        """递归处理 dict / list / str 里的 ``{{ }}``。
+
+        Args:
+            data: 待解析的数据。
+            missing: 传入一个列表时，把**求值为 ``None`` 的表达式**收集进去。
+                后置清理靠它判断「目标 id 根本没取到」，避免拼出
+                ``DELETE /xxx/None`` 这种请求。默认不收集，行为不变。
+        """
         if isinstance(data, str):
-            return self._process_string(data)
+            return self._process_string(data, missing)
         if isinstance(data, dict):
-            return {k: self.process_data(v) for k, v in data.items()}
+            return {k: self.process_data(v, missing) for k, v in data.items()}
         if isinstance(data, list):
-            return [self.process_data(v) for v in data]
+            return [self.process_data(v, missing) for v in data]
         return data
 
     # ---------------- 内部实现 ----------------
 
-    def _process_string(self, value: str) -> Any:
+    def _process_string(self, value: str, missing: list[str] | None = None) -> Any:
         matches = list(_EXPR_RE.finditer(value))
         if not matches:
             return value
 
         # 整串就是一个表达式时，保留原始类型（数字仍是数字）
         if len(matches) == 1 and matches[0].group(0) == value.strip():
-            return self.resolve_expression(matches[0].group(1).strip())
+            expression = matches[0].group(1).strip()
+            result = self.resolve_expression(expression)
+            if result is None and missing is not None:
+                missing.append(expression)
+            return result
 
         # 拼接场景：一次扫描替换完。
         #
@@ -82,7 +93,11 @@ class VariableResolver:
         #   2. 前一次替换的结果如果恰好又像 ``{{...}}``，后面会被二次求值
         # 用 re.sub + 回调，每个表达式严格求值一次。
         def _replace(match: re.Match[str]) -> str:
-            return str(self.resolve_expression(match.group(1).strip()))
+            expression = match.group(1).strip()
+            result = self.resolve_expression(expression)
+            if result is None and missing is not None:
+                missing.append(expression)
+            return str(result)
 
         return _EXPR_RE.sub(_replace, value)
 

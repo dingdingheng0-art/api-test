@@ -33,13 +33,12 @@
 from __future__ import annotations
 
 import json
-import re
 from pathlib import Path
 from typing import Any
 
 import yaml
 
-from tools.importer.models import Endpoint, Param, sanitize_name
+from tools.importer.models import Endpoint, sanitize_name
 
 # 生成用例时的默认配置
 DEFAULT_PROJECT = "mall4j"
@@ -132,41 +131,70 @@ def build_asserts(ep: Endpoint) -> list[dict[str, Any]]:
 
     规则：
 
-    - 响应是 ``{code, success, result}`` 这种老接口格式 → 断言 code==200、success==true
-    - 响应示例里有字段 → 断言该字段存在（``is not None``）
+    - ``{code, success, ...}`` 包装 → 断言 code / success（这两条不算业务断言）
+    - ``result`` / ``data`` 里的字段 → 逐字段断言存在（``is not None``）
     - 数值字段用 ``approx_equal``（金额类的浮点数用 ``==`` 会因精度翻车）
+    - 业务数据是列表时断言字段存在，**不猜具体条数** —— 空列表也可能是合法响应
+
+    ``data`` 是 mall4j 的主响应字段。以前只认 ``result``，导致正例只剩
+    code/success 两条弱断言 —— 2026-11-10 全量生成里 141 条薄用例都是这么来的。
     """
     asserts: list[dict[str, Any]] = []
 
     example = ep.response_example
-    if isinstance(example, dict):
-        if "code" in example:
-            asserts.append({"type": "equal", "field": "code", "expected": example["code"]})
-        if "success" in example:
-            asserts.append({"type": "equal", "field": "success", "expected": example["success"]})
-        if "message" in example and example.get("message"):
-            asserts.append({"type": "contains", "field": "message",
-                            "expected": str(example["message"])[:40]})
-        result = example.get("result")
-        if isinstance(result, dict):
-            for key, value in list(result.items())[:5]:
-                if isinstance(value, bool):
-                    asserts.append({"type": "is_true" if value else "is_false",
-                                    "field": f"result.{key}"})
-                elif isinstance(value, float):
-                    # 浮点数用近似相等，避免精度问题
-                    asserts.append({"type": "approx_equal", "field": f"result.{key}",
-                                    "expected": value, "tolerance": 0.01})
-                elif isinstance(value, (str, int)):
-                    asserts.append({"type": "is not None", "field": f"result.{key}"})
-                elif isinstance(value, list):
-                    asserts.append({"type": "is not None", "field": f"result.{key}"})
-                elif isinstance(value, dict):
-                    # 对象字段用部分匹配，只比文档里给的字段
-                    asserts.append({"type": "subset", "field": f"result.{key}",
-                                    "expected": value})
+    if not isinstance(example, dict):
+        return asserts
+
+    if "code" in example:
+        asserts.append({"type": "equal", "field": "code", "expected": example["code"]})
+    if "success" in example:
+        asserts.append({"type": "equal", "field": "success", "expected": example["success"]})
+    if "message" in example and example.get("message"):
+        asserts.append({"type": "contains", "field": "message",
+                        "expected": str(example["message"])[:40]})
+
+    result = example.get("result")
+    if isinstance(result, dict):
+        asserts.extend(_field_asserts(result, "result"))
+
+    if "data" in example:
+        data = example.get("data")
+        if isinstance(data, dict):
+            if data:
+                asserts.extend(_field_asserts(data, "data"))
+            else:
+                asserts.append({"type": "exists", "field": "data"})
+        else:
+            # 列表 / null / 标量：只证明字段在，不猜内容
+            asserts.append({"type": "exists", "field": "data"})
+
+    # ``msg`` 是 mall4j 的稳定字段。业务断言不足时它至少能证明响应结构没变。
+    if example.get("msg") not in (None, ""):
+        asserts.append({"type": "exists", "field": "msg"})
 
     return asserts
+
+
+def _field_asserts(container: dict[str, Any], prefix: str, limit: int = 5) -> list[dict[str, Any]]:
+    """把一层响应字段翻译成断言（``prefix`` 是 ``result`` / ``data``）。"""
+    out: list[dict[str, Any]] = []
+    for key, value in list(container.items())[:limit]:
+        field = f"{prefix}.{key}"
+        if isinstance(value, bool):
+            out.append({"type": "is_true" if value else "is_false", "field": field})
+        elif isinstance(value, float):
+            # 浮点数用近似相等，避免精度问题
+            out.append({"type": "approx_equal", "field": field,
+                        "expected": value, "tolerance": 0.01})
+        elif isinstance(value, (str, int)):
+            out.append({"type": "is_not_none", "field": field})
+        elif isinstance(value, list):
+            # 列表断言字段存在即可；条数依赖环境数据，猜了就会假失败
+            out.append({"type": "exists", "field": field})
+        elif isinstance(value, dict):
+            # 对象字段用部分匹配，只比文档里给的字段
+            out.append({"type": "subset", "field": field, "expected": value})
+    return out
 
 
 def build_module_yaml(

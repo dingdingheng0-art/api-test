@@ -281,6 +281,20 @@ def test_broken_state_file_does_not_break_counting(isolated_cache):
     assert heal_state.record_failed_round("API-168") == 1
 
 
+@pytest.mark.parametrize("bad", ["garbage", 123, [1, 2]])
+def test_non_dict_record_does_not_break_counting(isolated_cache, bad):
+    """顶层是 dict、但某条记录被写成字符串/数字 —— 直接 ``.get`` 会抛
+    ``AttributeError``，整条自愈链路跟着挂。坏记录按「没记过」处理。"""
+    from ai.agent.tools import heal_state
+
+    (isolated_cache / "heal_state.json").write_text(
+        json.dumps({"API-7777": bad}), encoding="utf-8"
+    )
+    assert heal_state.failed_rounds("API-7777") == 0
+    assert heal_state.record_failed_round("API-7777") == 1
+    assert heal_state.failed_rounds("API-7777") == 1
+
+
 # --------------------------------------------------------------------------
 # 回滚
 # --------------------------------------------------------------------------
@@ -349,6 +363,20 @@ def test_case_id_is_parsed_from_allure_parameter():
     )
     assert _case_id_of({"parameters": [{"name": "yaml_case", "value": "没有编号的用例"}]}) == ""
     assert _case_id_of({}) == ""
+
+
+def test_case_id_ignores_dedupe_suffix():
+    """用例编号重名时框架会补 ``#2``，别把序号当成编号。"""
+    from ai.capabilities.diagnosis import _case_id_of
+
+    def _param(value):
+        return {"parameters": [{"name": "yaml_case", "value": value}]}
+
+    assert _case_id_of(_param("分页查询操作日志#API-183#2")) == "API-183"
+    assert _case_id_of(_param("查询#统计#API-183#2")) == "API-183"
+    # 编号本身就是数字时，不能被误当成序号
+    assert _case_id_of(_param("用例#123")) == "123"
+    assert _case_id_of(_param("用例#123#2")) == "123"
 
 
 def test_collect_failures_reads_top_level_attachments(tmp_path):
@@ -466,3 +494,65 @@ def test_diagnose_failures_maps_framework_attribution(monkeypatch, tmp_path):
     assert result["by_attribution"] == {"服务问题": 1}
     assert result["diagnoses"][0]["attribution"] == "服务问题"
     assert result["diagnoses"][0]["attribution_source"] == "框架归因"
+
+
+# ---------------------------------------------------------------------------
+# verify_heal：什么都没跑 ≠ 修好了
+# ---------------------------------------------------------------------------
+
+
+def _stub_run(monkeypatch, result: dict, exit_code: int = 0) -> None:
+    """把 run_cases 换成固定返回值（不真的发请求）。"""
+    from ai.agent.tools import execution
+
+    monkeypatch.setattr(
+        execution,
+        "run_cases",
+        lambda **_kwargs: {
+            "ok": True,
+            "exit_code": exit_code,
+            "result": result,
+            "failures": [],
+        },
+    )
+
+
+def test_verify_heal_rejects_empty_run(monkeypatch):
+    """total=0 是"一条都没跑"，不能判成 verified。
+
+    以前空参数化会变成一条 skipped 用例、退出码 0，
+    verify_heal 据此返回 verified=True —— 编号写错也能"验证通过"。
+    """
+    from ai.agent.tools import heal as heal_module
+    from ai.agent.tools import heal_state
+
+    _stub_run(monkeypatch, {"total": 0, "passed": 0, "failed": 0, "skipped": 0})
+
+    result = heal_module.verify_heal(case_id="API-9999")
+
+    assert result["verified"] is False
+    assert result["executed"] == 0
+    # 没验证到不是改动的错 —— 不能记失败轮次，也不能触发回滚
+    assert heal_state.failed_rounds("API-9999") == 0
+
+
+def test_verify_heal_rejects_all_skipped(monkeypatch):
+    from ai.agent.tools import heal as heal_module
+    from ai.agent.tools import heal_state
+
+    _stub_run(monkeypatch, {"total": 1, "passed": 0, "failed": 0, "skipped": 1})
+
+    result = heal_module.verify_heal(case_id="API-9998")
+
+    assert result["verified"] is False
+    assert heal_state.failed_rounds("API-9998") == 0
+
+
+def test_verify_heal_still_verifies_real_pass(monkeypatch):
+    from ai.agent.tools import heal as heal_module
+
+    _stub_run(monkeypatch, {"total": 1, "passed": 1, "failed": 0, "skipped": 0})
+
+    result = heal_module.verify_heal(case_id="API-168")
+
+    assert result["verified"] is True

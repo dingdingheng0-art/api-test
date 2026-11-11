@@ -22,6 +22,11 @@ GET  详情     按主键查得到（证明数据真实存在，不只是响应�
 "接口能返回"，落库断言意义不大；以及配置里标了 ``write: False`` 的模块
 （写接口本身在环境上就报 A00005，见 [[mall4j-env-defects]]）。
 
+**位置也算问题**：落库断言只该放主步骤（或前置）。写在「后置」的**验证类
+步骤**（比如「查数据」GET）里会单独列为「放错位置」—— 后置只做清理，断言
+放那里失败会被报成 teardown 错误，主步骤先失败时还会多一条误导性失败。
+后置 **DELETE 清理步骤**上的「删后查不到」是清理验证，不在此列。
+
 用法::
 
     python tools/maint/audit_db_assertions.py            # 只看缺哪些
@@ -79,6 +84,21 @@ def read_json(value: Any) -> Any:
         return json.loads(str(value))
     except (TypeError, ValueError):
         return None
+
+
+def _is_cleanup_step(item: Any) -> bool:
+    """后置步骤里，哪些是纯清理动作。
+
+    清理步骤（DELETE / factory_cleanup / db）上的落库断言是在验证"清理
+    有没有做干净"，属于后置自己的职责，不算放错位置。只有「查数据」这类
+    验证步骤上的落库断言才该挪回主步骤。
+    """
+    if not isinstance(item, dict):
+        return False
+    op = str(item.get("operation_type") or "").lower()
+    if op in ("factory", "factory_cleanup", "db"):
+        return True
+    return str(item.get("method") or "").upper() == "DELETE"
 
 
 def collect_assert_types(obj: Any, out: set[str]) -> None:
@@ -159,6 +179,9 @@ REQUIREMENT = {
 
 def audit(detail: bool) -> int:
     findings: list[dict[str, Any]] = []
+    # 落库断言放错位置：写在「后置」里。后置只做清理 —— 断言放那里，
+    # 失败会被报成 teardown 错误，主步骤先失败时还会多一条误导性失败。
+    misplaced: list[dict[str, Any]] = []
 
     for wb_path in sorted(CASE_ROOT.glob("*/*.xlsx")):
         module = wb_path.parent.name
@@ -199,9 +222,32 @@ def audit(detail: bool) -> int:
             if need != "detail" and cfg.get("write") is False:
                 continue
 
+            # 覆盖率只认主步骤和前置里的落库断言。后置里的单独算「放错位置」，
+            # 既不能拿来抵覆盖率，也不能装作没看见。
             types: set[str] = set()
-            for key in ("断言", "前置", "后置"):
+            for key in ("断言", "前置"):
                 collect_assert_types(read_json(ws.cell(row, cols[key]).value), types)
+
+            teardown_types: set[str] = set()
+            teardown_items = read_json(ws.cell(row, cols["后置"]).value) or []
+            if not isinstance(teardown_items, list):
+                teardown_items = [teardown_items]
+            for item in teardown_items:
+                if _is_cleanup_step(item):
+                    continue
+                collect_assert_types(item, teardown_types)
+            if teardown_types & DB_ASSERT_TYPES:
+                misplaced.append(
+                    {
+                        "module": module,
+                        "case_id": case_id,
+                        "name": name or path,
+                        "method": method,
+                        "path": path,
+                    }
+                )
+                # 有落库断言，只是放错位置 —— 该做的是挪，不是再补一条
+                continue
 
             if types & DB_ASSERT_TYPES:
                 continue
@@ -225,33 +271,43 @@ def audit(detail: bool) -> int:
 
     if not findings:
         print("所有该有落库断言的用例都补上了。")
-        return 0
+    else:
+        print(f"缺少落库断言的用例：{len(findings)} 条\n")
+        by_module: dict[str, list[dict[str, Any]]] = {}
+        for item in findings:
+            by_module.setdefault(item["module"], []).append(item)
 
-    print(f"缺少落库断言的用例：{len(findings)} 条\n")
-    by_module: dict[str, list[dict[str, Any]]] = {}
-    for item in findings:
-        by_module.setdefault(item["module"], []).append(item)
+        for module, items in sorted(by_module.items()):
+            table = items[0]["table"]
+            print(f"{module}  →  {table}  （{len(items)} 条）")
+            for item in items:
+                print(
+                    f"  {item['case_id']:8} {item['method']:6} {item['path']:36}"
+                    f" {item['need']:6} {item['name'][:24]}"
+                )
+                if detail:
+                    print(f"           要求: {REQUIREMENT[item['need']]}")
+                    print(f"           现有断言类型: {', '.join(item['types']) or '（无）'}")
+            print()
 
-    for module, items in sorted(by_module.items()):
-        table = items[0]["table"]
-        print(f"{module}  →  {table}  （{len(items)} 条）")
-        for item in items:
+        # 按缺口类型汇总，便于决定先补哪类
+        from collections import Counter
+
+        print("按缺口类型：")
+        for need, count in Counter(i["need"] for i in findings).most_common():
+            print(f"  {need:8} {count:3}  {REQUIREMENT[need]}")
+
+    if misplaced:
+        print(f"\n落库断言放在后置（应挪回主步骤）：{len(misplaced)} 条")
+        for item in misplaced:
             print(
                 f"  {item['case_id']:8} {item['method']:6} {item['path']:36}"
-                f" {item['need']:6} {item['name'][:24]}"
+                f" {item['name'][:24]}"
             )
-            if detail:
-                print(f"           要求: {REQUIREMENT[item['need']]}")
-                print(f"           现有断言类型: {', '.join(item['types']) or '（无）'}")
-        print()
+        print("  改法：把后置步骤 assert 里的 check=db 断言移到主步骤「断言」列；"
+              "后置只保留清理。")
 
-    # 按缺口类型汇总，便于决定先补哪类
-    from collections import Counter
-
-    print("按缺口类型：")
-    for need, count in Counter(i["need"] for i in findings).most_common():
-        print(f"  {need:8} {count:3}  {REQUIREMENT[need]}")
-    return 1
+    return 1 if findings or misplaced else 0
 
 
 def main() -> int:

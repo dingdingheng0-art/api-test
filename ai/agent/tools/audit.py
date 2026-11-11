@@ -22,6 +22,7 @@ from __future__ import annotations
 
 from typing import Any
 
+from ai.agent.tools._params import clamp_int, safe_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
 
 #: 逐条返回时单条参数最多多长（再长就是整份断言列表了）
@@ -38,7 +39,7 @@ def get_agent_audit(
     """读最近的工具调用记录（时间正序）。"""
     from ai.agent import audit_log
 
-    limit = max(1, min(int(limit or 50), 500))
+    limit = clamp_int(limit, 50, 1, 500)
     entries = audit_log.recent(
         limit=limit, tool=tool, only_failed=only_failed, origin=origin, run=run
     )
@@ -87,8 +88,8 @@ def get_agent_cost(
     """按工具聚合调用次数 / 失败数 / 耗时 / 成本档。"""
     from ai.agent import audit_log
 
-    limit = max(1, min(int(limit or 500), 2000))
-    since_minutes = max(0, int(since_minutes or 0))
+    limit = clamp_int(limit, 500, 1, 2000)
+    since_minutes = max(0, safe_int(since_minutes, 0))
 
     summary = audit_log.summarize(
         limit=limit, origin=origin, since_minutes=since_minutes, run=run

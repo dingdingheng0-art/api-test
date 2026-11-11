@@ -33,6 +33,7 @@ from __future__ import annotations
 
 import json
 import os
+import re
 import threading
 import time
 from collections import deque
@@ -52,14 +53,17 @@ MAX_ARG_CHARS = 200
 #: 全部参数加起来最多记多少字符（``create_case`` 的断言列表可能很长）
 MAX_ARGS_TOTAL = 1200
 
-#: 参数名里出现这些词就把值抹掉
+#: 参数名里出现这些词就把值抹掉。
+#:
+#: 匹配前会先去掉非字母数字（见 :func:`_is_secret_key`）—— 请求头的叫法
+#: 很花：``X-Api-Key`` / ``api_key`` / ``ApiKey`` 指的是同一件事，
+#: 不归一化就漏抹。
 _SECRET_KEYS = (
     "token",
     "password",
     "passwd",
     "secret",
     "authorization",
-    "api_key",
     "apikey",
     "cookie",
     "session",
@@ -226,39 +230,93 @@ def _rotate_if_needed(path: Path) -> None:
     log.info("审计日志已滚动: %s", path.name)
 
 
+def _is_secret_key(name: str) -> bool:
+    # 去掉 ``-`` / ``_`` / 空格再比，``X-Api-Key`` 和 ``api_key`` 才是同一个词
+    lowered = re.sub(r"[^a-z0-9]", "", str(name).lower())
+    return any(secret in lowered for secret in _SECRET_KEYS)
+
+
 def _sanitize(arguments: dict[str, Any]) -> dict[str, Any]:
-    """参数脱敏 + 截断。"""
-    out: dict[str, Any] = {}
-    budget = MAX_ARGS_TOTAL
+    """参数脱敏 + 截断。
 
-    for key, value in arguments.items():
-        name = str(key)
-        if any(secret in name.lower() for secret in _SECRET_KEYS):
-            out[name] = "***"
-            continue
-
-        text = value if isinstance(value, (int, float, bool)) or value is None else str(value)
-        if not isinstance(text, str):
-            out[name] = text
-            budget -= len(str(text))
-            continue
-
-        if len(text) > MAX_ARG_CHARS:
-            text = text[:MAX_ARG_CHARS] + "…"
-        if len(text) > budget:
-            text = text[: max(0, budget)] + "…"
-        out[name] = text
-        budget -= len(text)
-        if budget <= 0:
-            out["_truncated"] = True
-            break
-
+    **必须递归**：``create_case`` 的 ``request_headers`` 是嵌套 dict，
+    ``{"Authorization": "Bearer eyJ..."}`` 只在顶层按 key 抹的话，
+    token 会原样落进长期保留的审计日志。dict 和 list 都要看进去。
+    """
+    out, _cut = _sanitize_value(arguments, [MAX_ARGS_TOTAL])
+    if not isinstance(out, dict):
+        return {"value": out}
     return out
+
+
+def _sanitize_value(value: Any, budget: list[int]) -> tuple[Any, bool]:
+    """递归脱敏。返回 ``(清洗后的值, 是否因为预算耗尽而截断)``。
+
+    ``budget`` 是可变的单元素列表（跨递归共享剩余额度）。
+    """
+    if isinstance(value, dict):
+        result: dict[str, Any] = {}
+        for key, inner in value.items():
+            name = str(key)
+            if _is_secret_key(name):
+                result[name] = "***"
+                continue
+            result[name], cut = _sanitize_value(inner, budget)
+            if cut:
+                result["_truncated"] = True
+                return result, True
+        return result, False
+
+    if isinstance(value, (list, tuple)):
+        items: list[Any] = []
+        for item in value:
+            clean, cut = _sanitize_value(item, budget)
+            items.append(clean)
+            if cut:
+                return items, True
+        return items, False
+
+    if isinstance(value, (int, float, bool)) or value is None:
+        budget[0] -= len(str(value))
+        return value, budget[0] <= 0
+
+    text = str(value)
+    if len(text) > MAX_ARG_CHARS:
+        text = text[:MAX_ARG_CHARS] + "…"
+    if len(text) > budget[0]:
+        text = text[: max(0, budget[0])] + "…"
+        budget[0] = 0
+        return text, True
+    budget[0] -= len(text)
+    return text, budget[0] <= 0
 
 
 # --------------------------------------------------------------------------
 # 读
 # --------------------------------------------------------------------------
+
+
+def _as_float(value: Any) -> float:
+    """``epoch`` / ``duration_ms`` 被手改成 ``"abc"`` 时按 0 处理。
+
+    审计日志是**旁路数据**，但不等于可以信任它的每个字段：文件能被手改、
+    能被旧版本写成别的结构。一个坏字段不该让 ``get_agent_audit``
+    整个报错 —— 那会让排查工具在最需要它的时候不可用。
+    """
+    try:
+        return float(value or 0)
+    except (TypeError, ValueError):
+        return 0.0
+
+
+def _as_int(value: Any, default: int = 0) -> int:
+    # 0 / "" / None 都算"没给"，和原来的 ``int(value or default)`` 语义一致
+    if value is None or value == "" or value == 0:
+        return default
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
 
 
 def recent(
@@ -270,7 +328,7 @@ def recent(
     run: str = "",
 ) -> list[dict[str, Any]]:
     """最近 N 条记录（时间正序返回，方便直接看调用链）。"""
-    limit = max(1, min(int(limit or 100), 2000))
+    limit = max(1, min(_as_int(limit, 100), 2000))
     path = log_path()
     if not path.exists():
         return []
@@ -290,6 +348,8 @@ def recent(
                     entry = json.loads(line)
                 except ValueError:
                     continue  # 写了一半的行 / 手工改坏了，跳过就行
+                if not isinstance(entry, dict):
+                    continue  # 一行合法 JSON 但结构不对（``[]`` / ``5``），跳过
                 if wanted_tool and entry.get("tool") != wanted_tool:
                     continue
                 if wanted_origin and entry.get("origin") != wanted_origin:
@@ -298,7 +358,7 @@ def recent(
                     continue
                 if only_failed and entry.get("ok"):
                     continue
-                if since_epoch and float(entry.get("epoch") or 0) < since_epoch:
+                if since_epoch and _as_float(entry.get("epoch")) < since_epoch:
                     continue
                 tail.append(entry)
     except OSError as exc:
@@ -338,18 +398,20 @@ def summarize(
             },
         )
         bucket["calls"] += 1
-        bucket["duration_ms"] = round(bucket["duration_ms"] + float(entry.get("duration_ms") or 0), 1)
+        bucket["duration_ms"] = round(
+            bucket["duration_ms"] + _as_float(entry.get("duration_ms")), 1
+        )
         if not entry.get("ok"):
             bucket["failed"] += 1
             failed_total += 1
         cost = str(entry.get("cost") or "free")
         by_cost[cost] = by_cost.get(cost, 0) + 1
-        duration_total += float(entry.get("duration_ms") or 0)
+        duration_total += _as_float(entry.get("duration_ms"))
 
-        used = entry.get("tokens") or {}
-        if used:
+        used = entry.get("tokens")
+        if isinstance(used, dict):
             for key in ("prompt", "completion", "total"):
-                tokens[key] += int(used.get(key) or 0)
+                tokens[key] += _as_int(used.get(key))
 
     tools = sorted(by_tool.values(), key=lambda item: (-item["calls"], item["tool"]))
     total = len(entries)

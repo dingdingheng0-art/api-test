@@ -28,7 +28,6 @@ case_id                      用例名的一部分（保证唯一）
 
 from __future__ import annotations
 
-import json
 import re
 from pathlib import Path
 from typing import Any
@@ -207,15 +206,28 @@ def _parse_row(
     # 「接口名称」是作者自己写的业务名（中文），报告里显示它
     api_name = str(_get(row, "接口名称", default="")).strip()
 
+    # ---- 多步场景链 ----
+    # 「步骤」列是 JSON 数组，让**一行 Excel 表达一条多步用例**
+    # （创建 → 查询 → 修改 → 删除）。不填这一列就沿用老格式（一行一步），
+    # 现役用例完全不受影响。填了就以它为准；行级的「接口 / 请求方法 /
+    # 断言」只作为兜底展示字段（第一行仍能被 -k / 报告识别）。
+    multi_steps = _parse_steps(
+        _get(row, "步骤", "多步骤", "steps", default=""), global_headers
+    )
+
     # 一行什么都没填 → 跳过
-    if not (case_id or case_name or title or path):
+    if not (case_id or case_name or title or path or multi_steps):
         return None
     if not path:
-        raise ExcelCaseError(
-            f"第 {row.get('__row__')} 行（{case_id or case_name}）没有填「接口」"
-        )
-
-    method = str(_get(row, "请求方法", default="GET")).strip().upper()
+        if not multi_steps:
+            raise ExcelCaseError(
+                f"第 {row.get('__row__')} 行（{case_id or case_name}）没有填「接口」"
+            )
+        # 只填了「步骤」：行级接口从第一步兜底（老文件 / 手写表都可能这样）
+        path = str(multi_steps[0].get("path") or "")
+        method = str(multi_steps[0].get("method") or "GET").upper()
+    else:
+        method = str(_get(row, "请求方法", default="GET")).strip().upper()
 
     # 报告标题 = 「接口名称 - 场景说明」
     #   接口名称优先用作者填的「接口名称」列；
@@ -391,7 +403,8 @@ def _parse_row(
     if teardowns:
         case["teardowns"] = teardowns
 
-    case["steps"] = [step]
+    # 「步骤」列优先：多步用例的行级字段只是展示兜底，不能覆盖真实步骤链。
+    case["steps"] = multi_steps or [step]
 
     # ---- 参数化 ----
     params_spec = _parse_param_data(_get(row, "参数化数据", default=""))
@@ -453,6 +466,78 @@ def _parse_pre_post(value: Any, label: str) -> list[dict[str, Any]]:
         items.append(parsed)
 
     return items
+
+
+# --------------------------------------------------------------------------
+# 步骤（多步场景链）
+# --------------------------------------------------------------------------
+
+
+def _parse_steps(value: Any, global_headers: dict[str, Any]) -> list[dict[str, Any]]:
+    """解析「步骤」列 —— 一行 Excel 表达一条多步用例。
+
+    格式是 JSON 数组，每一项和 YAML 用例的 ``steps`` 一致::
+
+        [{"id": "create", "description": "创建地区", "method": "POST",
+          "path": "/admin/area", "data": {"areaName": "自动化区域"},
+          "assert": [{"check": "body", "jsonpath": "$.success",
+                      "comparator": "==", "expect": true}]},
+         {"id": "verify", "description": "查询刚创建的地区", "method": "GET",
+          "path": "/admin/area/{{create.data.areaId}}", "assert": [...]}]
+
+    不填这一列时返回空列表，调用方沿用「一行一步」的老逻辑 ——
+    现役用例完全不受影响。
+    """
+    raw = parse_json_cell(value, "步骤")
+    if raw in ("", {}, None):
+        return []
+    if isinstance(raw, dict):
+        raw = [raw]
+    if not isinstance(raw, list):
+        raise ExcelCaseError("「步骤」必须是 JSON 数组")
+
+    steps: list[dict[str, Any]] = []
+    for index, item in enumerate(raw, start=1):
+        if not isinstance(item, dict):
+            raise ExcelCaseError(f"「步骤」的第 {index} 项必须是对象: {item!r}")
+
+        path = str(item.get("path") or "").strip()
+        if not path:
+            raise ExcelCaseError(f"「步骤」的第 {index} 项缺少 path")
+        method = str(item.get("method") or "GET").strip().upper()
+
+        # 未知字段原样带过去（``response_type`` / ``skip_auth`` 等），
+        # 只把需要翻译的三个字段单独处理。
+        step: dict[str, Any] = {
+            key: val
+            for key, val in item.items()
+            if key not in ("assert", "headers", "params", "data")
+        }
+        step["id"] = str(item.get("id") or f"step{index}")
+        step["description"] = str(item.get("description") or item.get("name") or "")
+        step["path"] = path
+        step["method"] = method
+
+        headers = _parse_headers(item.get("headers"), global_headers)
+        if headers:
+            step["headers"] = headers
+
+        params = item.get("params")
+        if isinstance(params, dict) and params:
+            step["params"] = _convert_placeholders(_strip_bullets(params))
+        elif isinstance(params, str) and params.strip():
+            step["params"] = _convert_placeholders(parse_json_cell(params, "params"))
+
+        data = item.get("data")
+        if data not in (None, ""):
+            step["data"] = _convert_placeholders(_strip_bullets(data))
+
+        if item.get("assert"):
+            step["assert"] = _parse_asserts(item["assert"])
+
+        steps.append(step)
+
+    return steps
 
 
 # --------------------------------------------------------------------------
@@ -547,9 +632,13 @@ def _parse_asserts(value: Any) -> list[dict[str, Any]]:
 
         [{"check": "body", "jsonpath": "$.success", "comparator": "==", "expect": true}]
 
-    框架格式::
+    框架格式（没有 ``check``，直接写 ``type/field``）也认 ——「步骤」列和
+    前置/后置都是 JSON 单元格，手写或从 YAML 迁移过来时很自然会写成::
 
         {"type": "equal", "field": "success", "expected": True}
+
+    ⚠️ ``parse_json_cell`` 对 dict 是原样返回，所以列表里混着 dict 时
+    不能直接 ``.get``。
     """
     raw = parse_json_cell(value, "断言")
     if raw in ("", {}, None):
@@ -573,6 +662,16 @@ def _parse_asserts(value: Any) -> list[dict[str, Any]]:
 def _translate_assertion(item: dict[str, Any]) -> dict[str, Any] | None:
     """翻译一条断言。"""
     check = str(item.get("check") or "").strip().lower()
+
+    # 已经是框架内部格式：没有 ``check``、带 ``type``。原样通过
+    # （只做 ``${key}`` → ``{{key}}`` 的占位符统一）。
+    if not check:
+        if str(item.get("type") or "").strip():
+            return _convert_placeholders(dict(item))
+        raise ExcelCaseError(
+            f"断言既没有 check 也没有 type：{item!r}"
+            "（扁平写法要有 check，框架写法要有 type）"
+        )
     comparator = str(item.get("comparator") or "==").strip()
     expect = _convert_placeholders(item.get("expect"))
 

@@ -46,6 +46,46 @@ class LLMNotConfigured(LLMError):
     """没配 API key / base_url —— 调用方应该退回本地模式。"""
 
 
+def _as_text(value: Any) -> str:
+    """配置值转字符串。
+
+    yaml 会把 ``base_url: 8080`` 解析成 int、把 ``api_key: 12345`` 解析成数字；
+    直接 ``.rstrip()`` / ``.strip()`` 会 AttributeError，把「配置没填好」
+    变成启动即崩。
+    """
+    if value is None:
+        return ""
+    return value if isinstance(value, str) else str(value)
+
+
+def _as_int(value: Any, default: int) -> int:
+    try:
+        return int(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_float(value: Any, default: float) -> float:
+    try:
+        return float(value)
+    except (TypeError, ValueError):
+        return default
+
+
+def _as_headers(value: Any) -> dict[str, str]:
+    """把 headers 配置归一成 ``{str: str}``；认不出就当没配。"""
+    if isinstance(value, dict):
+        items: Any = value.items()
+    elif isinstance(value, (list, tuple)):
+        items = value
+    else:
+        return {}
+    try:
+        return {str(key): str(item) for key, item in items}
+    except (TypeError, ValueError):
+        return {}
+
+
 @dataclass
 class LLMConfig:
     """LLM 配置。"""
@@ -60,39 +100,42 @@ class LLMConfig:
 
     @classmethod
     def from_config(cls, raw: dict[str, Any] | None = None) -> "LLMConfig":
-        """从配置里读，配置里没有就找环境变量。"""
-        raw = dict(raw or {})
+        """从配置里读，配置里没有就找环境变量。
 
-        base_url = (
+        配置是**人写的 yaml**，类型不可假定（``timeout: "60s"``、
+        ``headers`` 写成列表、整段写成字符串都见过）。这里认不出的值退回
+        默认值，绝不因为一段配置写错让整个程序起不来。
+        """
+        raw = raw if isinstance(raw, dict) else {}
+
+        base_url = _as_text(
             raw.get("base_url")
             or os.environ.get("AI_BASE_URL")
             or os.environ.get("OPENAI_BASE_URL")
-            or ""
         ).rstrip("/")
 
-        api_key = (
+        api_key = _as_text(
             raw.get("api_key")
             or os.environ.get("AI_API_KEY")
             or os.environ.get("OPENAI_API_KEY")
             or os.environ.get("DASHSCOPE_API_KEY")
-            or ""
         )
 
-        model = (
+        model = _as_text(
             raw.get("model")
             or os.environ.get("AI_MODEL")
             or os.environ.get("OPENAI_MODEL")
-            or ""
         )
 
         return cls(
             base_url=base_url,
             api_key=api_key,
             model=model,
-            timeout=int(raw.get("timeout") or 60),
-            temperature=float(raw.get("temperature", 0.3)),
-            max_tokens=int(raw.get("max_tokens") or 4000),
-            extra_headers=dict(raw.get("headers") or {}),
+            # 0 和「没配」保留原来的区分：0 视为没填，回落默认值。
+            timeout=_as_int(raw.get("timeout"), 60) or 60,
+            temperature=_as_float(raw.get("temperature"), 0.3),
+            max_tokens=_as_int(raw.get("max_tokens"), 4000) or 4000,
+            extra_headers=_as_headers(raw.get("headers")),
         )
 
     @property
@@ -207,13 +250,25 @@ class LLMClient:
             payload["tool_choice"] = "auto"
 
         raw = self._post("/chat/completions", payload)
-        choices = raw.get("choices") or []
-        if not choices:
+        choices = raw.get("choices")
+        if not isinstance(choices, (list, tuple)) or not choices:
             raise LLMError(f"LLM 响应里没有 choices: {str(raw)[:300]}")
         choice = choices[0]
+        if not isinstance(choice, dict):
+            # 合法 json 但结构不对（有的网关 error 时也回 200）
+            raise LLMError(f"LLM 响应 choices[0] 不是对象: {str(raw)[:300]}")
+
+        message = choice.get("message")
+        if isinstance(message, str):
+            message = {"content": message}
+        elif not isinstance(message, dict):
+            message = {}
+        usage = raw.get("usage")
+        if not isinstance(usage, dict):
+            usage = {}
         return {
-            "message": choice.get("message") or {},
-            "usage": raw.get("usage") or {},
+            "message": message,
+            "usage": usage,
             "finish_reason": str(choice.get("finish_reason") or ""),
         }
 
@@ -254,6 +309,9 @@ class LLMClient:
             data = json.loads(raw)
         except json.JSONDecodeError as exc:
             raise LLMError(f"LLM 返回的不是 JSON: {raw[:300]!r}") from exc
+        if not isinstance(data, dict):
+            # 合法 JSON 但不是对象：后面 `data["choices"]` 会抛 TypeError 而不是 LLMError。
+            raise LLMError(f"LLM 返回的 JSON 不是对象: {raw[:300]!r}")
 
         _record_usage(data, self.config.model)
         return data
@@ -261,11 +319,18 @@ class LLMClient:
     @staticmethod
     def _extract_text(raw: dict[str, Any]) -> str:
         """从响应里取出文字内容。"""
-        choices = raw.get("choices") or []
-        if not choices:
+        choices = raw.get("choices")
+        if not isinstance(choices, (list, tuple)) or not choices:
             raise LLMError(f"LLM 响应里没有 choices: {str(raw)[:300]}")
+        choice = choices[0]
+        if not isinstance(choice, dict):
+            raise LLMError(f"LLM 响应 choices[0] 不是对象: {str(raw)[:300]}")
 
-        message = choices[0].get("message") or {}
+        message = choice.get("message")
+        if isinstance(message, str):
+            message = {"content": message}
+        elif not isinstance(message, dict):
+            message = {}
         content = message.get("content")
 
         # 有些服务返回的是数组形式的内容块
@@ -305,7 +370,10 @@ def parse_json_response(text: str) -> Any:
     2. 包在 ```json ... ``` 代码块里
     3. 前后有废话，中间夹着 JSON
     """
-    text = (text or "").strip()
+    # 调用方可能把非字符串传进来（替身客户端 / 网关返回了对象）。
+    # 这里只是解析入口，类型不对按「空内容」处理，别抛 AttributeError。
+    text = text if isinstance(text, str) else ("" if text is None else str(text))
+    text = text.strip()
 
     if not text:
         raise LLMError("模型返回了空内容")

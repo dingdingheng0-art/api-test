@@ -25,12 +25,13 @@ import pytest
 
 from framework.allure_util import allure, has_allure
 from framework.case_param import CasePayload, format_case_label
+from framework.session_scope import targets_interface_tests
 from testcases.case_loader import (
     discover_cases,
+    filter_case_files,
     load_cases_from_file,
     relative_case_path,
 )
-from utils import paths
 from utils.logs.log_manager import log
 from utils.cases.marks import extract_marks
 from utils.cases.module_manager import ModuleManager
@@ -38,7 +39,6 @@ from utils.cases.param_expander import expand_case
 from utils.cases.case_dependency import (
     DependencyError,
     build_graph_from_cases,
-    get_store,
 )
 
 
@@ -94,6 +94,18 @@ def pytest_addoption(parser: pytest.Parser) -> None:
     )
 
 
+#: 收集阶段发现「一条用例都没匹配到」时，把原因记在 config 上。
+#:
+#: ``pytest_generate_tests`` 里发现参数表为空时写入；
+#: ``pytest_collection_finish``（hooks.py）读到后按 pytest 自己的
+#: 「没有收集到用例」语义退出（退出码 5）。
+#:
+#: 为什么不能在这里直接抛：``pytest_generate_tests`` 在收集的 ``CallInfo``
+#: 里执行，任何异常都会被包装成一条 collection error（退出码 2 + 堆栈），
+#: 而不是干净的「no tests ran」。
+NO_CASES_REASON: pytest.StashKey[str] = pytest.StashKey()
+
+
 def pytest_configure(config: pytest.Config) -> None:
     """session 开始：注册框架认识的 mark。
 
@@ -136,6 +148,12 @@ def pytest_configure(config: pytest.Config) -> None:
         }
     )
 
+    # 下面要扫用例目录（模块清单 + 用例里用到的标签），只有接口 session
+    # 才需要。``pytest unit_tests`` 把整个 testcases/ 扫一遍纯属浪费，
+    # 扫出来的标签也用不上。
+    if not targets_interface_tests(config):
+        return
+
     # 动态注册 modules.yaml 里定义的模块标签
     # （不注册的话 pytest 会报 "Unknown pytest.mark.xxx" 警告）
     from utils.cases.module_manager import ModuleManager
@@ -166,7 +184,6 @@ def _collect_case_marks() -> list[str]:
     扫描失败就跳过 —— 注册标签只是消除警告，不该影响执行。
     """
     from testcases.case_loader import discover_cases, load_cases_from_file
-    from utils.cases.param_expander import expand_case
 
     marks: list[str] = []
     seen: set[str] = set()
@@ -185,10 +202,12 @@ def _collect_case_marks() -> list[str]:
         for data in all_cases:
             try:
                 case = data["testcase"]
-                expand_case(data, yaml_file)
-            except Exception:  # noqa: BLE001
+            except (KeyError, TypeError):  # noqa: BLE001 - 坏数据不该挡住收集
                 continue
 
+            # 这里**不要**先 expand_case：标签是写在用例本体上的，
+            # 参数展开只是复制一份、把 parameters 填进去。以前展开完
+            # 还把结果丢掉 —— 等于整个用例目录白解析、白深拷贝一遍。
             for mark in extract_marks(case):
                 if mark not in seen:
                     seen.add(mark)
@@ -212,17 +231,14 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
     # 用例根目录由"用例来源"开关决定（Excel 目录 / YAML 目录 / 两个都扫）
     candidates = discover_cases()
-    if only_projects:
-        candidates = [(p, f) for p, f in candidates if p in only_projects]
-    if only_modules:
-        candidates = [
-            (p, f)
-            for p, f in candidates
-            if relative_case_path(f).parts[1:2]
-            and relative_case_path(f).parts[1] in only_modules
-        ]
-    if only_files:
-        candidates = [(p, f) for p, f in candidates if str(f.resolve()) in only_files]
+    # 项目 / 模块 / 文件三种筛选和 ``scripts/run.py --list`` 共用一份实现，
+    # 避免"清单里列出的条数"和"实际跑的条数"对不上。
+    candidates = filter_case_files(
+        candidates,
+        projects=only_projects,
+        modules=only_modules,
+        files=only_files,
+    )
 
     # 按模块顺序排（登录模块先跑，后面的用例才有 token）
     candidates = ModuleManager.sort_cases(candidates)
@@ -246,12 +262,17 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
 
         unknown = status_filter - set(ALL_STATUSES)
         if unknown:
-            log.warning(
-                "未知的用例状态 %s（可用：%s）",
-                "、".join(sorted(unknown)),
-                "、".join(ALL_STATUSES),
+            # 不能只打 warning 然后继续：过滤条件被清空后，
+            # ``_status_allows`` 会落到默认分支（只跑 debugged），
+            # 用户以为"只跑 draft"，实际跑的是默认集合，且日志里
+            # 只有一行 warning —— 结论完全不可信。
+            raise pytest.UsageError(
+                "未知的用例状态：%s（可用：%s）"
+                % (
+                    "、".join(sorted(unknown)),
+                    "、".join(ALL_STATUSES),
+                )
             )
-            status_filter = status_filter & set(ALL_STATUSES)
 
     skipped_by_status: dict[str, int] = {}
 
@@ -349,6 +370,16 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
             if item.param_name:
                 case_id = f"{case_id}[{_safe_id(item.param_name)}]"
             ids.append(case_id)
+
+    if not params:
+        # 0 条用例不能静默「成功」：pytest 对空参数化会留下一条
+        # ``test_api_case[NOTSET]`` 占位项并标成 skipped，全跳过时退出码是 0。
+        # 自愈的 verify_heal 会据此认定「改好了」，而实际一条都没跑。
+        # 记下原因，交给 pytest_collection_finish 按「没有收集到用例」退出。
+        config.stash[NO_CASES_REASON] = _no_cases_message(
+            only_projects, only_modules, only_files, only_case_ids, skipped_by_status
+        )
+
     metafunc.parametrize("yaml_case", params, ids=ids)
 
     # 告诉用户有多少用例因为状态被跳过了 —— 静默跳过会让人以为用例丢了
@@ -365,6 +396,44 @@ def pytest_generate_tests(metafunc: pytest.Metafunc) -> None:
                 "提示：这些用例没写 status: debugged，所以 CI 不会跑。"
                 "本地想全跑可以加 --run-draft"
             )
+
+
+def _no_cases_message(
+    only_projects: set[str],
+    only_modules: set[str],
+    only_files: list[str],
+    only_case_ids: set[str],
+    skipped_by_status: dict[str, int],
+) -> str:
+    """拼出「一条用例都没匹配到」的说明（带筛选条件，方便直接改命令）。"""
+    filters: list[str] = []
+    if only_projects:
+        filters.append("--case-project=" + "、".join(sorted(only_projects)))
+    if only_modules:
+        filters.append("--case-module=" + "、".join(sorted(only_modules)))
+    if only_files:
+        # 只显示文件名，绝对路径太长，终端里看不到重点
+        filters.append("--case-file=" + "、".join(Path(f).name for f in only_files))
+    if only_case_ids:
+        filters.append("--case-id=" + "、".join(sorted(only_case_ids)))
+
+    message = "没有匹配到任何用例"
+    if filters:
+        message += "（筛选条件：" + "；".join(filters) + "）"
+
+    if skipped_by_status:
+        from utils.cases.case_status import STATUS_LABELS
+
+        parts = [
+            f"{STATUS_LABELS.get(status, status)} {count} 条"
+            for status, count in sorted(skipped_by_status.items())
+        ]
+        message += (
+            "；另有 "
+            + "、".join(parts)
+            + " 因调试状态被跳过（需要时加 --run-draft 或 --case-status）"
+        )
+    return message
 
 
 def _unique_suffix(
@@ -474,6 +543,20 @@ def _sort_by_dependencies(
     if not loaded:
         return loaded
 
+    # 每条用例声明的依赖（没有就是空列表）
+    dependencies = [
+        _extract_dependencies((data or {}).get("testcase") or {})
+        for _project, _path, data in loaded
+    ]
+
+    # 没有任何用例声明依赖时**原样返回**。
+    #
+    # 以前不管有没有依赖都整体按拓扑序重排，而依赖图以「用例名」为 key：
+    # 同名用例（不同模块都有 not_exist / page）会互相覆盖，结果 106 条里
+    # 有 9 个位置被挪动 —— 和 docstring 写的"没有依赖的用例保持原位置"相反。
+    if not any(dependencies):
+        return loaded
+
     try:
         graph = build_graph_from_cases(loaded)
     except Exception as exc:  # noqa: BLE001
@@ -487,30 +570,39 @@ def _sort_by_dependencies(
             + "\n".join(f"  - {p}" for p in problems)
         )
 
-    # 按拓扑顺序重排；同一项目内的依赖才有效，跨项目的保持原顺序
-    order_index = {
-        name: index
-        for index, name in enumerate(graph.topological_order())
-    }
+    # 只把「被依赖的用例」往前拉，其余用例保持原始相对顺序。
+    #
+    # 不用 ``sorted(loaded, key=拓扑序)``：那样没依赖的用例也会被整体重排。
+    # 这里按原始顺序遍历，遇到有依赖的用例就先把它的依赖递归输出。
+    index_by_name: dict[str, list[int]] = {}
+    for index, (_project, _path, data) in enumerate(loaded):
+        name = str(((data or {}).get("testcase") or {}).get("name") or "").strip()
+        if name:
+            index_by_name.setdefault(name, []).append(index)
 
-    # 没有依赖的用例保持原位置；有依赖的按拓扑序插入
-    # 简单做法：整体按拓扑序排，没被拓扑序覆盖的（跨项目）留在原位
-    original = {name: index for index, (_p, _f, d) in enumerate(loaded) for name in [str((d or {}).get("testcase", {}).get("name") or "")]}
+    ordered: list[tuple[str, Path, dict[str, Any]]] = []
+    emitted: set[int] = set()
 
-    def sort_key(item: tuple[str, Path, dict[str, Any]]) -> tuple[int, int]:
-        project, _path, data = item
-        name = str((data or {}).get("testcase", {}).get("name") or "")
-        if name in order_index:
-            return (0, order_index[name])
-        return (1, original.get(name, 0))
+    def emit(index: int) -> None:
+        if index in emitted:
+            return
+        # 先标记再递归：有环时 validate 已经抛错，这里只防极端情况下
+        # 无限递归（宁可顺序不完美，也不能把进程卡死）。
+        emitted.add(index)
+        for dependency in dependencies[index]:
+            # 同名用例可能有多个，按语义把它们都排在依赖方前面
+            for dep_index in index_by_name.get(dependency, []):
+                emit(dep_index)
+        ordered.append(loaded[index])
 
-    result = sorted(loaded, key=sort_key)
+    for index in range(len(loaded)):
+        emit(index)
 
     summary = graph.summary()
     if "没有用例依赖关系" not in summary:
         log.info("用例依赖：%s", summary)
 
-    return result
+    return ordered
 
 
 @pytest.hookimpl(tryfirst=True)

@@ -186,9 +186,11 @@ tools/importer/
 ├── dispatcher.py        格式识别 + 分发
 ├── case_builder.py      生成 YAML / Excel 用例
 ├── cli.py               命令行入口
-├── web.py               本地网页上传页
-└── test_importer.py     单元测试（44 条）
+└── web.py               本地网页上传页
 ```
+
+单元测试在 `unit_tests/test_importer.py`（45 条）——
+和框架其它单测放在一起，`python scripts/run_unit.py` 会一并跑到。
 
 要加新格式（比如 Postman），只要写一个解析器返回 `Endpoint` 列表，
 在 `dispatcher.py` 里注册一下就行，生成用例和网页都不用改。
@@ -198,7 +200,7 @@ tools/importer/
 ## 跑测试
 
 ```powershell
-python -m pytest tools/importer/test_importer.py -v
+python -m pytest unit_tests/test_importer.py -v
 ```
 
 这些是纯单元测试，不联网、不调接口。

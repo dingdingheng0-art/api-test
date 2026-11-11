@@ -34,7 +34,6 @@ import base64
 import json
 import os
 import time
-from pathlib import Path
 from typing import Any
 
 from utils.logs.log_manager import log

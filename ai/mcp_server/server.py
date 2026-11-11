@@ -96,8 +96,13 @@ def handle_request(method: str, params: dict[str, Any]) -> Any:
                 "断言只能变强：删断言或把比较符改松会被 apply_case_change 拒绝，"
                 "不要用 allow_weakening 绕过它。"
                 "run_cases 有边界：只给 project 会被拒绝，一次最多跑 50 条、"
-                "一次会话累计最多 100 条 —— 逐个模块拆开跑同样算跑全量，"
+                "一次会话累计最多 50 条 —— 逐个模块拆开跑同样算跑全量，"
                 "用户要跑全量时先报条数和代价、请他确认。"
+                "新生成/改完的用例是 draft，验证时必须带 run_draft=true —— "
+                "不带的话一条都不会执行，total=0 不代表通过。"
+                "set_case_status 转 debugged 会核对「跑通过」凭据（run_cases "
+                "整体通过后自动记账）；没跑过、或记账之后又改过用例，都会被拒 —— "
+                "不要用 force 绕过，正常做法是重新跑一遍。"
                 "想回看自己刚才调了什么、花了多少 token，用 get_agent_audit / get_agent_cost。"
             ),
         }

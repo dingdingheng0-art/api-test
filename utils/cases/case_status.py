@@ -46,13 +46,13 @@ YAML 里写 ``status:``：
 **怎么把用例标成"调试通过"**
 
 跑一遍确认没问题后，把 ``status`` 改成 ``debugged`` 提交。
-或者用 ``python scripts/run.py --mark-passed <用例名>`` 自动改（见 ``tools/maint``）。
+或者用维护脚本改（默认 dry-run，加 ``--apply`` 才真写）::
+
+    python tools/maint/case_status.py --name <用例名> --status debugged --apply
 """
 from __future__ import annotations
 
 from typing import Any
-
-from utils.logs.log_manager import log
 
 # ---- 状态定义 ----
 
@@ -189,85 +189,3 @@ def resolve_status(case: dict[str, Any]) -> str:
             return DRAFT
 
     return DRAFT
-
-
-def should_run(case: dict[str, Any]) -> bool:
-    """这条用例现在该不该跑。"""
-    return resolve_status(case) in RUNNABLE_STATUSES
-
-
-def explain(case: dict[str, Any]) -> str:
-    """生成一句人话说明，报告和日志里用。"""
-    status = resolve_status(case)
-    label = STATUS_LABELS.get(status, status)
-    name = str(case.get("name") or "未命名用例")
-    return f"用例「{name}」当前状态：{label}"
-
-
-def describe_missing_status(case: dict[str, Any]) -> str | None:
-    """没写 ``status`` 时给个提示。
-
-    返回 ``None`` 表示不用提示（比如显式写了 draft）。
-    """
-    if not isinstance(case, dict):
-        return None
-
-    raw = case.get("status")
-    if raw is None:
-        meta = case.get("allure") or {}
-        if isinstance(meta, dict):
-            raw = meta.get("status")
-
-    if raw is not None:
-        return None
-
-    return (
-        "没写 status，默认按「未调试」处理（CI 不会执行）。"
-        "确认没问题后改成 status: debugged。"
-    )
-
-
-def status_filter(
-    cases: list[tuple[str, dict[str, Any]]],
-    include_draft: bool = False,
-    only_statuses: set[str] | None = None,
-) -> list[tuple[str, dict[str, Any]]]:
-    """按状态筛选用例。
-
-    Args:
-        cases: ``[(项目名, 用例数据), ...]``
-        include_draft: 是否把 ``draft`` 也算上（本地调试用）
-        only_statuses: 只保留这些状态（优先于 ``include_draft``）
-    """
-    if only_statuses:
-        return [
-            (project, case)
-            for project, case in cases
-            if resolve_status(case) in only_statuses
-        ]
-
-    if include_draft:
-        return list(cases)
-
-    return [
-        (project, case)
-        for project, case in cases
-        if resolve_status(case) in RUNNABLE_STATUSES
-    ]
-
-
-def log_status_summary(cases: list[tuple[str, dict[str, Any]]]) -> None:
-    """打印一份状态统计（收集阶段用）。"""
-    counts: dict[str, int] = {}
-    for _project, case in cases:
-        status = resolve_status(case)
-        counts[status] = counts.get(status, 0) + 1
-
-    if not counts:
-        return
-
-    parts = [
-        f"{STATUS_LABELS.get(status, status)} {count} 条"
-        for status, count in sorted(counts.items())
-    ]
-    log.info("用例状态分布：%s", "，".join(parts))

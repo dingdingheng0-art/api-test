@@ -209,12 +209,15 @@ def test_later_teardowns_still_run_after_one_fails() -> None:
                         "operation_type": "api",
                         "path": "/first",
                         "method": "POST",
+                        # 这条用例只验证「后续清理继续执行」，显式放行
+                        "allow_dangerous": True,
                     },
                     {
                         "id": "second",
                         "operation_type": "api",
                         "path": "/second",
                         "method": "POST",
+                        "allow_dangerous": True,
                     },
                 ],
             }
@@ -256,8 +259,20 @@ def test_multiple_cleanup_failures_are_all_reported() -> None:
                     {"id": "noop", "operation_type": "noop", "value": {"ok": True}},
                 ],
                 "teardowns": [
-                    {"id": "a", "operation_type": "api", "path": "/a", "method": "POST"},
-                    {"id": "b", "operation_type": "api", "path": "/b", "method": "POST"},
+                    {
+                        "id": "a",
+                        "operation_type": "api",
+                        "path": "/a",
+                        "method": "POST",
+                        "allow_dangerous": True,
+                    },
+                    {
+                        "id": "b",
+                        "operation_type": "api",
+                        "path": "/b",
+                        "method": "POST",
+                        "allow_dangerous": True,
+                    },
                 ],
             }
         }
@@ -369,7 +384,14 @@ def test_teardown_runs_when_setup_fails() -> None:
                     {"id": "s", "operation_type": "api", "path": "/setup", "method": "POST"},
                 ],
                 "teardowns": [
-                    {"id": "t", "operation_type": "api", "path": "/cleanup", "method": "POST"},
+                    {
+                        "id": "t",
+                        "operation_type": "api",
+                        "path": "/cleanup",
+                        "method": "POST",
+                        # setup 挂了没有产出可引用，这条用例只验证清理照跑
+                        "allow_dangerous": True,
+                    },
                 ],
             }
         }
@@ -534,6 +556,22 @@ def test_teardown_allows_delete_of_data_it_created() -> None:
     assert _teardown_deletes_case_data(case, delete_td) is True
 
 
+def test_teardown_fixed_target_is_not_allowed_by_setup_write() -> None:
+    """用例造过数据 ≠ 清理可以删固定 id（以前有写步骤就无条件放行）。"""
+    from testcases.case_runner import _teardown_deletes_case_data
+
+    case = {
+        "setups": [
+            {"id": "造品牌", "method": "POST", "path": "/admin/brand"},
+        ],
+        "steps": [{"id": "改品牌", "method": "PUT", "path": "/admin/brand"}],
+    }
+    # 造的是新品牌，删的却是环境里 id=100 的品牌
+    delete_td = {"id": "清理", "method": "DELETE", "path": "/admin/brand/100"}
+
+    assert _teardown_deletes_case_data(case, delete_td) is False
+
+
 def test_teardown_explicit_allow_dangerous_wins() -> None:
     from testcases.case_runner import _teardown_deletes_case_data
 
@@ -546,3 +584,192 @@ def test_teardown_explicit_allow_dangerous_wins() -> None:
     }
 
     assert _teardown_deletes_case_data(case, delete_td) is True
+
+
+# ---------------------------------------------------------------------------
+# 6. 清理目标没取到（{{...}} 求值为 None）不许发 DELETE /xxx/None
+# ---------------------------------------------------------------------------
+
+
+def _case_with_empty_lookup() -> dict[str, Any]:
+    """造数据后查询查不到 → max_id 返回 None，清理路径会拼成 ``/None``。"""
+    return {
+        "testcase": {
+            "name": "查不到数据",
+            "setups": [
+                {
+                    "id": "造数据",
+                    "operation_type": "api",
+                    "method": "POST",
+                    "path": "/sys/menu",
+                    "data": {"name": "t"},
+                },
+                {
+                    "id": "查数据",
+                    "operation_type": "api",
+                    "method": "GET",
+                    "path": "/sys/menu/table",
+                },
+            ],
+            "steps": [
+                {
+                    "id": "noop",
+                    "operation_type": "noop",
+                    "value": {"ok": True},
+                    # 有没有真失败由 assert_handler 决定；这里只是让
+                    # 断言层被调用到（主步骤失败的用例才走"跳过清理"分支）
+                    "assert": [
+                        {"type": "equal", "field": "value.ok", "expected": True}
+                    ],
+                }
+            ],
+            "teardowns": [
+                {
+                    "id": "清理",
+                    "operation_type": "api",
+                    "method": "DELETE",
+                    "path": '/sys/menu/{{tools.max_id(查数据.data, "menuId")}}',
+                }
+            ],
+        }
+    }
+
+
+def _capture_sends_with_empty_list(runner: CaseRunner) -> list[dict[str, Any]]:
+    """查询接口返回空列表，造数接口正常。"""
+    calls: list[dict[str, Any]] = []
+
+    def _fake_send(method: str, url: str, **kwargs: Any) -> Any:
+        calls.append({"method": method, "url": url, **kwargs})
+        if url.endswith("/sys/menu/table"):
+            return {"code": 200, "data": {"records": []}}, {
+                "status_code": 200,
+                "headers": {},
+                "elapsed_ms": 1,
+            }
+        return {"code": 200, "data": {"id": 1}}, {
+            "status_code": 200,
+            "headers": {},
+            "elapsed_ms": 1,
+        }
+
+    from utils.http import request_handler
+
+    request_handler.RequestHandler.send_with_retry_full = staticmethod(_fake_send)  # type: ignore[assignment]
+    return calls
+
+
+def test_teardown_skips_when_case_already_failed() -> None:
+    """用例本来就失败时，目标取不到只跳过，不发 DELETE /None、也不加噪音。"""
+    runner = _make_runner()
+
+    class _FakeHandler:
+        def handle_assertion(self, **_kwargs: Any) -> None:
+            raise AssertionError("主步骤断言失败")
+
+    runner.assert_handler = _FakeHandler()  # type: ignore[assignment]
+    calls = _capture_sends_with_empty_list(runner)
+
+    from utils.http import request_handler
+
+    original = request_handler.RequestHandler.send_with_retry_full
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            runner.run_case(_case_with_empty_lookup(), "demo")
+    finally:
+        request_handler.RequestHandler.send_with_retry_full = original  # type: ignore[assignment]
+
+    urls = [c["url"] for c in calls]
+    assert not any(u.endswith("/None") for u in urls), (
+        f"目标没取到时不该发 DELETE /None，实际发了 {urls}"
+    )
+    # 原始失败原因没被清理噪音盖住
+    message = str(exc_info.value)
+    assert "主步骤断言失败" in message
+    assert "A00005" not in message
+    assert "后置清理也失败" not in message
+
+
+def test_teardown_fails_loudly_when_target_missing_and_case_passed() -> None:
+    """用例通过但清理目标没取到 → 明确报「没清干净」，不是 A00005。"""
+    from testcases.case_runner import CleanupTargetMissing
+
+    runner = _make_runner()
+
+    class _FakeHandler:
+        def handle_assertion(self, **_kwargs: Any) -> None:
+            return None
+
+    runner.assert_handler = _FakeHandler()  # type: ignore[assignment]
+    calls = _capture_sends_with_empty_list(runner)
+
+    from utils.http import request_handler
+
+    original = request_handler.RequestHandler.send_with_retry_full
+    try:
+        with pytest.raises(AssertionError) as exc_info:
+            runner.run_case(_case_with_empty_lookup(), "demo")
+    finally:
+        request_handler.RequestHandler.send_with_retry_full = original  # type: ignore[assignment]
+
+    urls = [c["url"] for c in calls]
+    assert not any(u.endswith("/None") for u in urls), (
+        f"目标没取到时不该发 DELETE /None，实际发了 {urls}"
+    )
+    # 抛的是 CleanupTargetMissing（AssertionError 子类 = 记 failed 而不是 error）
+    root = exc_info.value.__cause__
+    assert any(
+        isinstance(e, CleanupTargetMissing) for e in (root, exc_info.value)
+    ) or "清理目标未取到" in str(exc_info.value)
+    assert "清理目标未取到" in str(exc_info.value)
+
+
+def test_teardown_target_in_params_also_blocked() -> None:
+    """目标 id 写在 params 里、求值为 None 时同样不发请求。"""
+    runner = _make_runner()
+
+    class _FakeHandler:
+        def handle_assertion(self, **_kwargs: Any) -> None:
+            return None
+
+    runner.assert_handler = _FakeHandler()  # type: ignore[assignment]
+    calls = _capture_sends_with_empty_list(runner)
+
+    case = {
+        "testcase": {
+            "name": "params 里的目标没取到",
+            "setups": [
+                {
+                    "id": "查数据",
+                    "operation_type": "api",
+                    "method": "GET",
+                    "path": "/sys/menu/table",
+                }
+            ],
+            "steps": [{"id": "noop", "operation_type": "noop", "value": {"ok": True}}],
+            "teardowns": [
+                {
+                    "id": "清理",
+                    "operation_type": "api",
+                    "method": "DELETE",
+                    "path": "/sys/menu",
+                    "params": {
+                        "id": '{{tools.max_id(查数据.data, "menuId")}}'
+                    },
+                }
+            ],
+        }
+    }
+
+    from utils.http import request_handler
+
+    original = request_handler.RequestHandler.send_with_retry_full
+    try:
+        with pytest.raises(AssertionError):
+            runner.run_case(case, "demo")
+    finally:
+        request_handler.RequestHandler.send_with_retry_full = original  # type: ignore[assignment]
+
+    assert not any(c["method"] == "DELETE" for c in calls), (
+        f"目标没取到时不该发 DELETE，实际发了 {calls}"
+    )

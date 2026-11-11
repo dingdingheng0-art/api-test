@@ -96,6 +96,185 @@ class ToolSpec:
         }
 
 
+# ---------------------------------------------------------------------------
+# 参数校验：params_schema 真正参与调用
+#
+# MCP 客户端只看 schema，不保证按它传参。以前 schema 只用于展示，
+# handler 里再靠 ``int(limit or 50)`` 之类的写法兜底 —— 但那就是
+# "静默换成默认值"，模型以为按 1000 条查，实际拿到 50 条也不会知道。
+# 这里在进入 handler 前做一次真校验：
+#
+# - 能在不丢信息的前提下转的转掉（``"50"`` → 50、``"true"`` → True）
+# - 转不了就抛 ``ToolError``，由 ``call`` 收成结构化错误
+# - ``None`` 一律按"没给"处理：可选参数走默认值，必填参数报缺失
+# ---------------------------------------------------------------------------
+
+_TYPE_NAMES = {
+    "string": "字符串",
+    "integer": "整数",
+    "number": "数字",
+    "boolean": "布尔值",
+    "array": "数组",
+    "object": "对象",
+    "null": "null",
+}
+
+
+def _type_names(types: list[str]) -> str:
+    return " / ".join(_TYPE_NAMES.get(t, t) for t in types)
+
+
+def _declared_types(rule: Any) -> list[str]:
+    if not isinstance(rule, dict):
+        return []
+    declared = rule.get("type")
+    if isinstance(declared, str):
+        return [declared]
+    if isinstance(declared, (list, tuple)):
+        return [str(item) for item in declared]
+    return []
+
+
+def _matches_type(kind: str, value: Any) -> bool:
+    if kind == "string":
+        return isinstance(value, str)
+    if kind == "integer":
+        return isinstance(value, int) and not isinstance(value, bool)
+    if kind == "number":
+        return isinstance(value, (int, float)) and not isinstance(value, bool)
+    if kind == "boolean":
+        return isinstance(value, bool)
+    if kind == "array":
+        return isinstance(value, (list, tuple))
+    if kind == "object":
+        return isinstance(value, dict)
+    if kind == "null":
+        return value is None
+    return True  # 没见过的类型名不拦，避免误伤自定义 schema
+
+
+def _coerce(name: str, value: Any, kind: str) -> tuple[bool, Any]:
+    """尽量把 JSON 里常见的"类型给错但意思明确"的值转回来。"""
+    if kind == "integer":
+        if isinstance(value, float):
+            return (True, int(value)) if value.is_integer() else (False, value)
+        try:
+            return True, int(str(value).strip())
+        except (TypeError, ValueError):
+            return False, value
+    if kind == "number":
+        if isinstance(value, bool):
+            return False, value
+        try:
+            return True, float(value)
+        except (TypeError, ValueError):
+            return False, value
+    if kind == "boolean":
+        if isinstance(value, int) and value in (0, 1):
+            return True, bool(value)
+        text = str(value).strip().lower()
+        if text in ("true", "1", "yes", "on"):
+            return True, True
+        if text in ("false", "0", "no", "off"):
+            return True, False
+        return False, value
+    if kind == "string" and isinstance(value, (int, float, bool)):
+        return True, str(value)
+    return False, value
+
+
+def _check_items(name: str, values: list[Any], rule: Any) -> None:
+    if not isinstance(rule, dict):
+        return
+    types = _declared_types(rule.get("items") or {})
+    if not types:
+        return
+    for index, item in enumerate(values):
+        if not any(_matches_type(kind, item) for kind in types):
+            raise ToolError(
+                f"参数 {name}[{index}] 需要{_type_names(types)}，"
+                f"收到 {type(item).__name__}",
+                hint="检查数组元素的写法。",
+            )
+
+
+def _coerce_value(name: str, value: Any, rule: Any) -> Any:
+    if not isinstance(rule, dict):
+        return value
+    types = _declared_types(rule)
+
+    enum = rule.get("enum")
+    if enum is not None:
+        if value in enum:
+            return value
+        raise ToolError(
+            f"参数 {name} 只能是 {', '.join(map(str, enum))}，收到 {value!r}",
+            hint="改成允许的取值再试。",
+        )
+
+    if not types:
+        return value
+
+    result: Any = None
+    for kind in types:
+        if _matches_type(kind, value):
+            result = list(value) if kind == "array" and isinstance(value, tuple) else value
+            break
+    else:
+        for kind in types:
+            ok_, coerced = _coerce(name, value, kind)
+            if ok_:
+                result = coerced
+                break
+        else:
+            raise ToolError(
+                f"参数 {name} 需要{_type_names(types)}，"
+                f"收到 {type(value).__name__}: {value!r}",
+                hint="按 schema 的类型传参（数字/布尔值不要写成别的结构）。",
+            )
+
+    if isinstance(result, list):
+        _check_items(name, result, rule)
+    return result
+
+
+def _normalize_arguments(spec: ToolSpec, arguments: dict[str, Any]) -> dict[str, Any]:
+    """按 ``params_schema`` 校验并归一参数；不合格直接抛 ``ToolError``。"""
+    schema = spec.params_schema if isinstance(spec.params_schema, dict) else {}
+    props: dict[str, Any] = schema.get("properties")
+    if not isinstance(props, dict):
+        props = {}
+    declared_required = schema.get("required")
+    if isinstance(declared_required, str):
+        required = {declared_required}
+    elif isinstance(declared_required, (list, tuple, set)):
+        required = {str(key) for key in declared_required}
+    else:
+        required = set()
+
+    unknown = sorted(key for key in arguments if key not in props)
+    if unknown and schema.get("additionalProperties") is False:
+        raise ToolError(
+            f"不认识的参数: {', '.join(unknown)}",
+            hint=f"该工具的参数: {ToolRegistry._describe_params(spec)}",
+        )
+
+    missing = sorted(key for key in required if arguments.get(key) is None)
+    if missing:
+        raise ToolError(
+            f"缺少必填参数: {', '.join(missing)}",
+            hint=f"该工具的参数: {ToolRegistry._describe_params(spec)}",
+        )
+
+    normalized: dict[str, Any] = {}
+    for key, value in arguments.items():
+        if value is None:
+            normalized[key] = None
+            continue
+        normalized[key] = _coerce_value(key, value, props.get(key) or {})
+    return normalized
+
+
 class ToolRegistry:
     """工具注册表（进程内单例）。"""
 
@@ -161,6 +340,11 @@ class ToolRegistry:
             return self._fail(name, exc, started, arguments)
 
         try:
+            arguments = _normalize_arguments(spec, arguments)
+        except ToolError as exc:
+            return self._fail(name, exc, started, arguments)
+
+        try:
             result = spec.handler(**arguments)
         except ToolError as exc:
             return self._fail(name, exc, started, arguments)
@@ -218,13 +402,20 @@ class ToolRegistry:
 
     @staticmethod
     def _describe_params(spec: ToolSpec) -> str:
-        props = (spec.params_schema.get("properties") or {})
-        if not props:
+        schema = spec.params_schema if isinstance(spec.params_schema, dict) else {}
+        props = schema.get("properties")
+        if not isinstance(props, dict) or not props:
             return "（无参数）"
-        return "、".join(
-            f"{k}({v.get('type', 'any')}{'，必填' if k in (spec.params_schema.get('required') or []) else ''})"
-            for k, v in props.items()
-        )
+        required = schema.get("required")
+        if isinstance(required, str):
+            required = [required]
+        required = set(required or [])
+        parts = []
+        for key, rule in props.items():
+            types = _declared_types(rule)
+            kind = "any" if not types else " | ".join(types)
+            parts.append(f"{key}({kind}{'，必填' if key in required else ''})")
+        return "、".join(parts)
 
     def _record(
         self,

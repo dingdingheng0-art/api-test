@@ -42,11 +42,14 @@ for _stream in (sys.stdout, sys.stderr):
     except (AttributeError, ValueError):  # pragma: no cover - 老环境兜底
         pass
 
-# 本文件在 scripts/ 下，项目根是它的上一级
-_PROJECT_ROOT = Path(__file__).resolve().parent.parent
-if str(_PROJECT_ROOT) not in sys.path:
-    sys.path.insert(0, str(_PROJECT_ROOT))
+# 本文件在 scripts/ 下，项目根是它的上一级。
+# 这里只是为了把项目根塞进 sys.path（否则下面 import 不到 utils.*）——
+# 真正的项目根定义只有一处：``utils.paths.PROJECT_ROOT``。
+_BOOTSTRAP_ROOT = Path(__file__).resolve().parent.parent
+if str(_BOOTSTRAP_ROOT) not in sys.path:
+    sys.path.insert(0, str(_BOOTSTRAP_ROOT))
 
+from utils.paths import PROJECT_ROOT  # noqa: E402
 from framework.case_param import format_params
 from framework.report_generator import ALLURE_RESULTS, REPORTS_ROOT  # noqa: E402
 from testcases.case_loader import discover_cases, load_cases_from_file  # noqa: E402
@@ -86,6 +89,17 @@ def parse_args() -> argparse.Namespace:
         action="store_true",
         help="连状态不是 debugged 的用例（draft / disabled / broken）也一起跑",
     )
+    parser.add_argument(
+        "--no-retry",
+        action="store_true",
+        help="不重试疑似环境抖动的失败用例（原样透传给 pytest）",
+    )
+    parser.add_argument(
+        "--log-cli-level",
+        default=None,
+        metavar="LEVEL",
+        help="控制台日志级别（原样透传给 pytest），如 INFO / DEBUG",
+    )
     parser.add_argument("--clear-cache", action="store_true", help="清掉登录 token 缓存")
     parser.add_argument("--show-cache", action="store_true", help="查看登录 token 缓存状态")
     parser.add_argument("--no-cache", action="store_true", help="本次运行不用 token 缓存")
@@ -108,8 +122,11 @@ def list_cases(
     支持和执行时一样的筛选（``-m`` 标签、``-k`` 关键字），
     方便先看清楚「这个标签下有哪些用例」再决定跑哪几条。
     """
-    from testcases.case_loader import find_data_file, relative_case_path
-    from utils import paths
+    from testcases.case_loader import (
+        filter_case_files,
+        find_data_file,
+        relative_case_path,
+    )
     from utils.cases.module_manager import ModuleManager
     from utils.cases.param_expander import expand_case
 
@@ -118,15 +135,10 @@ def list_cases(
         print("没有找到任何用例")
         return
 
-    if only_projects:
-        cases = [(p, f) for p, f in cases if p in only_projects]
-    if only_modules:
-        cases = [
-            (p, f)
-            for p, f in cases
-            if relative_case_path(f).parts[1:2]
-            and relative_case_path(f).parts[1] in only_modules
-        ]
+    # 和 pytest 收集阶段用同一个筛选函数 —— 否则"清单条数"和"实跑条数"会不一致
+    cases = filter_case_files(
+        cases, projects=only_projects, modules=only_modules
+    )
 
     # 按执行顺序排
     cases = ModuleManager.sort_cases(cases)
@@ -458,14 +470,14 @@ def build_pytest_args(args: argparse.Namespace) -> list[str]:
     """把命令行参数翻译成 pytest 参数。"""
     # 指向项目根 —— 根 conftest.py 里用 pytest_plugins 声明了框架各层
     # （指向 testcases/ 的话根 conftest 不会被加载，插件就失效了）
-    cmd = [str(_PROJECT_ROOT), "-v" if args.verbose else "-q"]
+    cmd = [str(PROJECT_ROOT), "-v" if args.verbose else "-q"]
 
     # 只收集用例层，工具脚本（tools/）不混进接口测试报告
-    cmd += ["--ignore", str(_PROJECT_ROOT / "tools")]
+    cmd += ["--ignore", str(PROJECT_ROOT / "tools")]
     # 单元测试（框架自己的单测）单独跑，不混进接口测试报告
-    cmd += ["--ignore", str(_PROJECT_ROOT / "unit_tests")]
+    cmd += ["--ignore", str(PROJECT_ROOT / "unit_tests")]
     # 临时脚本目录（调试用），里面可能有 test_*.py，别被误收集
-    cmd += ["--ignore", str(_PROJECT_ROOT / "data")]
+    cmd += ["--ignore", str(PROJECT_ROOT / "data")]
     if args.env:
         cmd += ["--apienv", args.env]
     for project in args.project:
@@ -484,6 +496,10 @@ def build_pytest_args(args: argparse.Namespace) -> list[str]:
         cmd += ["-k", args.keyword]
     if args.run_draft:
         cmd += ["--run-draft"]
+    if args.no_retry:
+        cmd += ["--no-retry"]
+    if args.log_cli_level:
+        cmd += ["--log-cli-level", args.log_cli_level]
 
     # JUnit XML —— CI（Jenkins / GitLab）的 junit 步骤只认这个格式。
     # 和 allure / html 无关，只要跑用例就产出，免得 CI 端拿不到结构化结果。

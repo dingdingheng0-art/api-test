@@ -23,9 +23,9 @@ from __future__ import annotations
 
 from typing import Any
 
-from ai.agent.tools.registry import ToolError, ToolSpec, ok, truncate_text
+from ai.agent.tools._params import clamp_int
+from ai.agent.tools.registry import ToolError, ToolSpec, ok
 from utils import paths
-from utils.logs.log_manager import log
 
 # 归因 -> 建议动作（给智能体的行动指令）
 ACTION_BY_ATTRIBUTION = {
@@ -66,21 +66,38 @@ def diagnose_failures(
     if since_last_run and result_file.exists() and allure_dir.exists():
         cutoff = result_file.stat().st_mtime
         fresh = _fresh_cases(allure_dir, cutoff)
-        if fresh:
-            kept = [f for f in failures if str(f.case) in fresh]
+        # ⚠️ fresh 为空**也要**过滤：空的含义是"本轮没有任何 allure 结果"，
+        # 不是"无法判断所以全都保留"。以前这里用的是 `if fresh:`，
+        # 空集直接跳过过滤，上一轮的失败全被当成"本轮失败"归因了一遍。
+        #
+        # None 才是"判断不了"（目录读不了）—— 这时才保留原样。
+        if fresh is not None:
+            kept = [
+                f for f in failures if str(getattr(f, "case", "") or "") in fresh
+            ]
             stale_dropped = len(failures) - len(kept)
             failures = kept
 
     if not failures:
+        failed_count = _failed_count(result_file)
+        if failed_count > 0:
+            hint = (
+                f"result.json 显示上一轮有 {failed_count} 条失败，"
+                "但没有本轮的 allure 明细（run_cases 默认 report=none，不写 allure 结果）。"
+                "想拿到失败明细和归因，请用 report=allure 重跑一次。"
+            )
+        else:
+            hint = "上次运行没有失败用例。"
+        if stale_dropped:
+            hint += f"（已忽略 {stale_dropped} 条更早轮次的旧失败）"
         return ok(
             total=0,
             diagnoses=[],
             stale_dropped=stale_dropped,
-            hint="上次运行没有失败用例。"
-            + (f"（已忽略 {stale_dropped} 条更早轮次的旧失败）" if stale_dropped else ""),
+            hint=hint,
         )
 
-    limit = max(1, min(int(limit or 20), 100))
+    limit = clamp_int(limit, 20, 1, 100)
     selected = failures[:limit]
 
     # AI 归因要花钱、要时间 —— 默认关闭，由调用方显式开启
@@ -121,17 +138,51 @@ def diagnose_failures(
     )
 
 
-def _fresh_cases(allure_dir: Any, cutoff: float) -> set[str]:
-    """本轮（``result.json`` 写盘之后）产生的 allure 结果里有哪些用例名。"""
+def _failed_count(result_file: Any) -> int:
+    """读 ``result.json`` 里的失败条数（读不到当 0）。"""
     import json
 
+    try:
+        data = json.loads(result_file.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return 0
+    if not isinstance(data, dict):
+        # 合法 JSON 但结构不对（被写成 ``[]`` / ``0``）——当没有结果。
+        return 0
+    try:
+        return int(data.get("failed") or 0) + int(data.get("error") or 0)
+    except (TypeError, ValueError):
+        return 0
+
+
+def _fresh_cases(allure_dir: Any, cutoff: float) -> set[str] | None:
+    """本轮（``result.json`` 写盘之后）产生的 allure 结果里有哪些用例名。
+
+    Returns:
+        用例名集合；目录读不了返回 ``None``（表示"判断不了"，调用方
+        保留全部失败，而不是把它们全丢掉）。空集合是有效结果 ——
+        表示本轮确实没有产生任何 allure 结果。
+    """
+    import json
+
+    if not allure_dir.exists():
+        return None
+
     names: set[str] = set()
-    for path in allure_dir.glob("*-result.json"):
+    try:
+        entries = list(allure_dir.glob("*-result.json"))
+    except OSError:
+        return None
+
+    for path in entries:
         try:
             if path.stat().st_mtime < cutoff:
                 continue
             data = json.loads(path.read_text(encoding="utf-8"))
         except (OSError, ValueError):
+            continue
+        if not isinstance(data, dict):
+            # allure 结果被写坏成列表 / 标量时跳过这一个文件，别炸整轮归因。
             continue
         name = data.get("name") or data.get("fullName")
         if name:

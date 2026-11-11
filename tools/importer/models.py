@@ -116,7 +116,7 @@ _INVALID_CHARS = re.compile(r"[^0-9A-Za-z_\u4e00-\u9fff]+")
 
 # 通用前缀 —— 剥掉它们，剩下的第一段才是有意义的模块名
 GENERIC_PREFIXES = {
-    "manager", "api", "apis", "rest", "service", "services", "gateway",
+    "admin", "manager", "api", "apis", "rest", "service", "services", "gateway",
     "v1", "v2", "v3", "index", "open", "public", "private", "web", "app",
 }
 

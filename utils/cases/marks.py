@@ -25,48 +25,20 @@ YAML 里写：
     pytest apitest -m "not slow"     # 排除 slow
     pytest apitest -m "smoke or p0"
 
-框架也会自动注册这些 mark，避免 pytest 报 "unknown mark" 警告。
+mark 的注册在 ``framework/pytest_plugin.py`` 的 ``pytest_configure`` 里
+（``config.addinivalue_line("markers", ...)``），本模块只负责解析。
 """
 from __future__ import annotations
 
+import re
 from typing import Any
 
-import pytest
-
-# 框架预注册的 mark（避免 unknown mark 警告）
-KNOWN_MARKS = (
-    "smoke",     # 冒烟
-    "p0", "p1", "p2",  # 优先级
-    "api",       # 接口用例
-    "ui",        # UI 用例
-    "wip",       # 开发中，CI 默认跳过
-    "slow",      # 慢用例
-    "flaky",     # 不稳定
-    "regression",  # 回归
-)
-
-
-def register_marks() -> None:
-    """把框架认识的 mark 注册到 pytest（消除 unknown mark 警告）。"""
-    for mark in KNOWN_MARKS:
-        config = pytest.Config  # noqa: F841 - 仅为类型提示
-        try:
-            # 通过 pytest 的 mark 机制注册
-            _register_single(mark)
-        except Exception:  # noqa: BLE001 - 注册失败不影响执行
-            pass
-
-
-def _register_single(name: str) -> None:
-    """注册单个 mark。"""
-    # pytest 8+ 有公开的 mark 存储；这里用兼容方式
-    try:
-        from _pytest.mark.structures import Mark
-
-        Mark(name, (), {}, _ispytest=True)
-    except Exception:  # noqa: BLE001
-        pass
-
+#: 字符串写法 ``"smoke and p0"`` 里的分隔符。
+#:
+#: ⚠️ 必须按「整词」匹配。以前是 ``value.replace("and", " ")`` ——
+#: 标签里只要含 and/or 就被切碎：``order`` 变成 ``der``、``brand``
+#: 变成 ``br``，``-m order`` 一条都筛不到。
+_MARK_SEPARATOR = re.compile(r"\b(?:and|or)\b|[,，]")
 
 def extract_marks(case: dict[str, Any]) -> list[str]:
     """从用例数据里取出所有 mark。
@@ -84,8 +56,8 @@ def extract_marks(case: dict[str, Any]) -> list[str]:
         if not value:
             continue
         if isinstance(value, str):
-            # "smoke and p0" -> ["smoke", "p0"]
-            parts = value.replace("and", " ").replace("or", " ").replace(",", " ").split()
+            # "smoke and p0" -> ["smoke", "p0"]；"order" 保持 "order"
+            parts = _MARK_SEPARATOR.split(value)
             marks.extend(p.strip() for p in parts if p.strip())
         elif isinstance(value, (list, tuple)):
             marks.extend(str(m).strip() for m in value if str(m).strip())
@@ -100,9 +72,3 @@ def extract_marks(case: dict[str, Any]) -> list[str]:
             seen.add(m)
             result.append(m)
     return result
-
-
-def apply_marks(item: pytest.Item, marks: list[str]) -> None:
-    """把 mark 打到 pytest 的测试项上。"""
-    for mark_name in marks:
-        item.add_marker(mark_name)

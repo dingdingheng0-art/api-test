@@ -150,6 +150,10 @@ class KnowledgeStore:
             conn.execute("DELETE FROM edge")
             if self._fts:
                 conn.execute("DELETE FROM node_fts")
+            # 元信息描述的是"图里有什么"，图清空了它必须一起失效。
+            # 否则重建中途失败时 built_at 还留着上一轮的值，
+            # 工具会以为图谱是完整且最新的。
+            conn.execute("DELETE FROM meta WHERE key IN ('built_at', 'stats')")
             conn.commit()
 
     def add_node(

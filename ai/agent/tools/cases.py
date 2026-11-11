@@ -20,6 +20,7 @@ from ai.agent.tools._common import (
     find_case_by_number,
     iter_cases,
 )
+from ai.agent.tools._params import clamp_int
 from ai.agent.tools.registry import ToolError, ToolSpec, ok
 
 MAX_CASES = 500
@@ -34,7 +35,7 @@ def list_cases(
     limit: int = 50,
 ) -> dict[str, Any]:
     """列出用例（摘要，不含完整步骤）。"""
-    limit = max(1, min(int(limit or 50), MAX_CASES))
+    limit = clamp_int(limit, 50, 1, MAX_CASES)
 
     pairs = iter_cases(
         project=project, module=module, mark=mark, keyword=keyword, status=status
@@ -87,19 +88,84 @@ def get_case(case_id: str) -> dict[str, Any]:
     return ok(case=case_detail(ref, case))
 
 
+#: 沙箱模块前缀 —— AI 生成的用例写在这里，不碰现役模块
+SANDBOX_PREFIX = "ai_"
+
+#: 判定「沙箱模块已经没人管」的天数
+SANDBOX_STALE_DAYS = 30
+
+
+def _sandbox_state(item: dict[str, Any], now: float) -> dict[str, Any]:
+    """沙箱模块的体检结论。
+
+    沙箱模块是 AI 生成用例的落脚点，默认全是 draft —— 不进 CI，
+    也不会自动消失。没人管它就会一直堆着，越堆越分不清哪条还有用。
+    """
+    by_status = item["by_status"]
+    idle_days = int((now - item["last_modified"]) // 86400) if item["last_modified"] else None
+    all_draft = by_status.get("debugged", 0) == 0
+    stale = idle_days is None or idle_days >= SANDBOX_STALE_DAYS
+
+    if all_draft and stale:
+        advice = "全是 draft 且很久没动：确认无用后可以整个目录删掉"
+    elif all_draft:
+        advice = "全是 draft（不进 CI）：跑通转正，或确认无用后清理"
+    elif stale:
+        advice = "有已转正的用例，但很久没人跑过：重跑确认"
+    else:
+        advice = "有已转正的用例，正常维护中"
+
+    return {
+        "sandbox": True,
+        "draft": by_status.get("draft", 0),
+        "debugged": by_status.get("debugged", 0),
+        "idle_days": idle_days,
+        "advice": advice,
+    }
+
+
 def list_modules(project: str = "") -> dict[str, Any]:
-    """列出项目/模块及其用例数量。"""
+    """列出项目/模块及其用例数量。
+
+    沙箱模块（``ai_*``）额外带 ``sandbox`` / ``draft`` / ``debugged`` /
+    ``idle_days`` —— 这些目录是 AI 生成的产物，不会自动退役。
+    """
+    import time
+
     from utils import paths
 
     pairs = iter_cases(project=project)
-    counter: Counter[str] = Counter()
-    for ref, _ in pairs:
-        counter[f"{ref.project}/{ref.module}"] += 1
+    stats: dict[str, dict[str, Any]] = {}
+    now = time.time()
+
+    for ref, _case in pairs:
+        key = f"{ref.project}/{ref.module}"
+        item = stats.setdefault(
+            key,
+            {
+                "module": ref.module,
+                "cases": 0,
+                "by_status": Counter(),
+                "last_modified": 0.0,
+            },
+        )
+        item["cases"] += 1
+        item["by_status"][ref.status] += 1
+        try:
+            mtime = (paths.PROJECT_ROOT / ref.file).stat().st_mtime
+        except OSError:
+            mtime = 0.0
+        item["last_modified"] = max(item["last_modified"], mtime)
 
     projects: dict[str, list[dict[str, Any]]] = {}
-    for key, count in sorted(counter.items()):
+    sandbox_modules: list[str] = []
+    for key, item in sorted(stats.items()):
         proj, mod = key.split("/", 1)
-        projects.setdefault(proj, []).append({"module": mod, "cases": count})
+        entry: dict[str, Any] = {"module": mod, "cases": item["cases"]}
+        if mod.startswith(SANDBOX_PREFIX):
+            entry.update(_sandbox_state(item, now))
+            sandbox_modules.append(f"{proj}/{mod}")
+        projects.setdefault(proj, []).append(entry)
 
     if not projects:
         return ok(
@@ -107,13 +173,20 @@ def list_modules(project: str = "") -> dict[str, Any]:
             hint=f"没有扫到用例。检查用例来源配置（当前目录 {paths.CASES_ROOT.name}）和 --case-source 开关。",
         )
 
-    return ok(
+    payload = ok(
         projects=[
             {"project": proj, "modules": mods, "total": sum(m["cases"] for m in mods)}
             for proj, mods in projects.items()
         ],
         total_cases=len(pairs),
     )
+    if sandbox_modules:
+        payload["sandbox_modules"] = sandbox_modules
+        payload["hint"] = (
+            "ai_* 是 AI 生成的沙箱模块：用例默认 draft，不进 CI，也不会自动退役。"
+            "确认无用后手工删除整个目录（框架不会自动删用例）。"
+        )
+    return payload
 
 
 TOOLS = [
@@ -173,7 +246,10 @@ TOOLS = [
     ),
     ToolSpec(
         name="list_modules",
-        description="列出所有项目和模块，以及每个模块的用例数量。用于了解项目全貌、发现没测的模块。",
+        description=(
+            "列出所有项目和模块，以及每个模块的用例数量。用于了解项目全貌、发现没测的模块。"
+            "ai_* 沙箱模块额外给出 draft / debugged 条数和闲置天数，用来判断该不该清理。"
+        ),
         params_schema={
             "type": "object",
             "properties": {

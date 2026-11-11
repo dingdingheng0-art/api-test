@@ -276,6 +276,97 @@ def test_pk_row_exists_queries_the_module_table(tool):
     assert tool.pk_row_exists(StubClient(None), module, 1) is False
 
 
+def test_post_db_asserts_move_from_teardown_to_main_step(tool, tmp_path):
+    """落库断言只放主步骤：旧版写在后置「查数据」里的要挪回来。
+
+    后置只做清理。断言留在后置，失败会被报成 teardown 错误，主步骤先失败
+    时还会多一条误导性的失败。
+    """
+    import openpyxl
+
+    path = tmp_path / "shop_notice.xlsx"
+    headers = [
+        "用例ID",
+        "接口",
+        "请求方法",
+        "请求数据",
+        "断言",
+        "前置",
+        "后置",
+        "用例状态",
+    ]
+    sql_count = "SELECT COUNT(*) FROM tz_notice WHERE title = %s"
+    sql_exists = "SELECT id FROM tz_notice WHERE title = %s"
+    name = "{{tools.fixed('k', '自动化公告')}}"
+
+    # 旧版工具留下的样子：两条落库断言挂在后置的「查数据」步骤上
+    teardowns = [
+        {
+            "id": "查数据",
+            "operation_type": "api",
+            "path": "/shop/notice/page",
+            "method": "GET",
+            "assert": [
+                {
+                    "check": "db",
+                    "sql": sql_count,
+                    "comparator": "==",
+                    "expect": 1,
+                    "params": [name],
+                },
+                {
+                    "check": "db",
+                    "sql": sql_exists,
+                    "comparator": "exists",
+                    "params": [name],
+                },
+            ],
+        },
+        {
+            "id": "清理数据",
+            "operation_type": "api",
+            "path": "/shop/notice/{{查数据.data.records[0].id}}",
+            "method": "DELETE",
+        },
+    ]
+    values = {
+        "用例ID": "API-900",
+        "接口": "/shop/notice",
+        "请求方法": "POST",
+        "请求数据": json.dumps({"title": name}),
+        "断言": json.dumps(
+            [{"check": "body", "jsonpath": "$.success", "comparator": "==", "expect": True}]
+        ),
+        "前置": "",
+        "后置": json.dumps(teardowns, ensure_ascii=False),
+        "用例状态": "debugged",
+    }
+
+    wb = openpyxl.Workbook()
+    ws = wb.active
+    ws.title = tool.SHEET
+    for idx, header in enumerate(headers, start=1):
+        ws.cell(1, idx).value = header
+        ws.cell(2, idx).value = values[header]
+    wb.save(path)
+
+    stats = tool.process_workbook(path, "shop_notice", dry_run=False, client=None)
+
+    assert stats["moved"] == 2
+    assert stats["db_added"] == 0, "已经存在的断言是挪过去的，不算新补"
+
+    wb = openpyxl.load_workbook(path)
+    ws = wb[tool.SHEET]
+    main = json.loads(ws.cell(2, headers.index("断言") + 1).value)
+    main_db = [item for item in main if item.get("check") == "db"]
+    assert [item["sql"] for item in main_db] == [sql_count, sql_exists]
+
+    teardowns = json.loads(ws.cell(2, headers.index("后置") + 1).value)
+    assert all("assert" not in item for item in teardowns)
+    # 「查数据」步骤本身要保留 —— 后置 DELETE 还要用它取 id
+    assert teardowns[0]["id"] == "查数据"
+
+
 def test_module_tables_exist_in_schema(tool):
     """映射里的表名/列名必须和真实库对得上（有 schema 快照时才检查）。"""
     schema_file = ROOT / ".cache" / "schema_mall4j.json"

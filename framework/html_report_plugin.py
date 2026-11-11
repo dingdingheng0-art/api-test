@@ -31,7 +31,10 @@ from __future__ import annotations
 
 import html as html_mod
 import re
+from functools import lru_cache
 from typing import Any
+
+import pytest
 
 # 从 nodeid 里抠出「项目/模块/文件#用例名[参数组]」
 #
@@ -62,6 +65,13 @@ def _unescape_unicode(text: str) -> str:
     return _UNICODE_ESCAPE.sub(repl, text)
 
 
+# ``optionalhook=True`` 不能省：
+#
+# 这两个钩子是 pytest-html 定义的，而本插件在根 conftest 里**无条件**加载。
+# 没装 pytest-html（比如只装了核心依赖）时，pytest 会报
+# ``PluginValidationError: unknown hook 'pytest_html_results_table_header'``，
+# 整个会话直接起不来 —— 明明只是少一个报告插件。
+@pytest.hookimpl(optionalhook=True)
 def pytest_html_results_table_header(cells: list[Any]) -> None:
     """给表头加三列。"""
     # 默认表头: Result / Test / Duration / Links（都是 <th>）
@@ -74,6 +84,7 @@ def pytest_html_results_table_header(cells: list[Any]) -> None:
     cells[1:1] = new_cells
 
 
+@pytest.hookimpl(optionalhook=True)
 def pytest_html_results_table_row(report: Any, cells: list[Any]) -> None:
     """给每行填三列的内容。
 
@@ -112,7 +123,10 @@ def resolve_row_info(report: Any) -> dict[str, str]:
     module = props.get("apitest_module", "")
     story = props.get("apitest_story", "")
 
-    info = parse_nodeid(nodeid)
+    # 收集阶段已经把场景写进 user_properties 了 —— 这时**不要**再去
+    # 扫用例文件找 story，否则每行报告都要把一个模块的 Excel 重新解析
+    # 一遍（132 行实测 1.87s，全是白费）。
+    info = parse_nodeid(nodeid, need_story=not story)
 
     if module:
         info["module"] = module
@@ -141,7 +155,7 @@ def _case_name_from_nodeid(nodeid: str) -> str:
         return match.group("case") or ""
     return ""
 
-def parse_nodeid(nodeid: str) -> dict[str, str]:
+def parse_nodeid(nodeid: str, need_story: bool = True) -> dict[str, str]:
     """从 nodeid 解析出模块 / 场景 / 用例名。
 
     .. code-block:: text
@@ -179,8 +193,9 @@ def parse_nodeid(nodeid: str) -> dict[str, str]:
 
     module_label = ModuleManager.get_label(project, module) or module
 
-    # 场景：用例的 allure.story（拿不到就用用例名）
-    story = _story_of(project, module, case) or case
+    # 场景：用例的 allure.story（拿不到就用用例名）。
+    # ``need_story=False`` 时调用方已经有权威的 story，跳过整目录扫描。
+    story = (_story_of(project, module, case) if need_story else "") or case
 
     # 简短 ID：项目/模块/文件#用例名（不带 pytest 那长串路径）
     short_id = f"{project}/{module}/{file_name}#{full_case}"
@@ -194,18 +209,31 @@ def parse_nodeid(nodeid: str) -> dict[str, str]:
 
 
 def _story_of(project: str, module: str, case_name: str) -> str:
-    """找用例定义的 allure.story。
+    """找用例定义的 allure.story（按模块缓存，见 ``_module_stories``）。"""
+    return _module_stories(project, module).get(case_name, "")
+
+
+@lru_cache(maxsize=256)
+def _module_stories(project: str, module: str) -> dict[str, str]:
+    """一个模块里「用例名 → allure.story」的映射。
 
     YAML 和 Excel 都要扫 —— Excel 里的用例同样带 ``allure.story``，
     只扫 YAML 会让 Excel 用例的场景列空着。
+
+    **必须缓存**：这个函数以前每条报告行都调一次，等于每行都重新打开
+    模块目录下的每本 Excel（openpyxl 全量解析）。行数 × 文件数是平方级
+    增长 —— 132 行就要 1.87s，上千条用例会拖到十几秒。
+    一个模块的文件只需要解析一次。
     """
     from testcases.case_loader import load_cases_from_file
     from utils.cases.module_manager import ModuleManager
 
+    stories: dict[str, str] = {}
+
     # 模块目录按"用例来源"决定在哪儿（cases/ 还是 cases_excel/）
     module_dir = ModuleManager._module_dir(project, module)
     if not module_dir.exists():
-        return ""
+        return stories
 
     files = sorted(module_dir.glob("*.yaml")) + sorted(module_dir.glob("*.xlsx"))
 
@@ -221,11 +249,11 @@ def _story_of(project: str, module: str, case_name: str) -> str:
             if not isinstance(item, dict):
                 continue
             tc = item.get("testcase") or {}
-            if tc.get("name") == case_name:
-                meta = tc.get("allure") or {}
-                if meta.get("story"):
-                    return str(meta["story"])
-    return ""
+            story = (tc.get("allure") or {}).get("story")
+            name = tc.get("name")
+            if name and story:
+                stories[str(name)] = str(story)
+    return stories
 
 
 def _esc(text: str) -> str:

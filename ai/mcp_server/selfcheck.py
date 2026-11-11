@@ -188,6 +188,10 @@ def run(verbose: bool = False) -> int:
         except ValueError:
             failures.append(f"响应不是合法 JSON：{line[:80]}")
             continue
+        if not isinstance(msg, dict):
+            # 合法 JSON 但不是对象（``5`` / ``[]``）——记一条，别让自检自己崩。
+            failures.append(f"响应不是 JSON 对象：{line[:80]}")
+            continue
         responses[msg.get("id")] = msg
 
     # 3. 通知不回复 —— 响应数量必须等于请求数量（有 id 的）
